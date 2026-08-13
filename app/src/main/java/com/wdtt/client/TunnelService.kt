@@ -373,7 +373,19 @@ class TunnelService : Service() {
                 RawTunVpnService.instance?.updateUnderlyingNetwork(network)
                 if (previous != null && previous != network) {
                     TunnelManager.addNetworkLog("[СЕТЬ] Сменился основной маршрут — проверяем туннель.")
-                    handleNetworkChange()
+                    // Намеренно не через handleNetworkChange: там живёт
+                    // настройка «Отключать на Wi-Fi», решение которой зависит
+                    // от флага wasOnWifi. Этот колбэк приходит раньше, чем
+                    // обычный успевает пополнить activeNetworks, и лишний
+                    // проход по той ветке сбивал бы состояние перехода.
+                    TunnelManager.scope.launch {
+                        // При включённой опции поднимающийся Wi-Fi туннель
+                        // сейчас погасит — переподключать его здесь значило бы
+                        // бороться с собственной настройкой.
+                        val stopOnWifi = SettingsStore(applicationContext).stopOnWifi.first()
+                        if (stopOnWifi && isUnderlyingWifiPresent()) return@launch
+                        scheduleNetworkRecovery()
+                    }
                 }
             }
 
