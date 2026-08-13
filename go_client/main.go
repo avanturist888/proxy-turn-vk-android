@@ -137,6 +137,9 @@ func main() {
 	// его кеши (см. epoch.go). Создаётся до чтения stdin, чтобы команда,
 	// пришедшая до старта воркеров, не наткнулась на nil.
 	epoch := newSessionEpoch(ctx)
+	// Проба пути: PROBE заставляет сессии немедленно проверить связь и
+	// оборвать только те, что не ответили (см. probe.go).
+	probe := newPathProbe()
 
 	// STDIN для PAUSE/RESUME/STOP/RECONNECT и CAPTCHA_RESULT
 	go func() {
@@ -154,6 +157,12 @@ func main() {
 			case line == "STOP":
 				cancel()
 				return
+			case line == "PROBE":
+				// Проверка пути после смены сети: живые сессии продолжат
+				// работать, мёртвые оборвутся за sessionProbeTimeout вместо
+				// полного таймаута тишины.
+				log.Printf("[КЛИЕНТ] PROBE: проверяем путь на всех сессиях")
+				probe.request()
 			case line == "RECONNECT":
 				// Мягкое переподключение после смены сети: рвём сессии,
 				// сохраняя кеш TURN-кредов VK, диспетчер и TUN-fd. Жёсткий
@@ -512,7 +521,7 @@ func main() {
 		go func(groupID int, isFirstGroup bool, configChan chan<- string, workerIds []int, startHashIndex int, waitR <-chan struct{}, sigR chan<- struct{}) {
 			defer wg.Done()
 			WorkerGroup(ctx, groupID, startHashIndex, tp, peer, disp, localPort,
-				isFirstGroup, configChan, workerIds, &pauseFlag, *deviceID, *connPassword, stats, waitR, sigR, epoch)
+				isFirstGroup, configChan, workerIds, &pauseFlag, *deviceID, *connPassword, stats, waitR, sigR, epoch, probe)
 		}(gID, isFirst, cc, ids, g, myWaitReady, mySignalReady)
 	}
 

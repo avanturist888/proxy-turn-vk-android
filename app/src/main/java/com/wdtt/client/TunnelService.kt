@@ -466,6 +466,13 @@ class TunnelService : Service() {
         networkRecoveryJob = TunnelManager.scope.launch {
             if (!TunnelManager.running.value || isTunnelPaused || recoveryBlockedByScreenOff()) return@launch
             TunnelManager.addNetworkLog("[СЕТЬ] Сеть изменилась. Ждём стабилизации без перезапуска VPN.")
+            // Короткая пауза на переезд маршрутов — и сразу активная проверка
+            // пути. Мёртвые сессии go_client оборвёт и пересоздаст сам за
+            // несколько секунд, не дожидаясь таймаута тишины и не трогая те,
+            // что смену сети пережили.
+            delay(2_000)
+            if (!TunnelManager.running.value || isTunnelPaused) return@launch
+            TunnelManager.probeTransport()
             delay(5_000)
             if (!TunnelManager.running.value || isTunnelPaused || recoveryBlockedByScreenOff() ||
                 System.currentTimeMillis() < wakeGraceUntilMs || !hasValidatedUnderlyingNetwork()) return@launch

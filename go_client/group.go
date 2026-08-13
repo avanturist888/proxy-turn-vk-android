@@ -38,6 +38,7 @@ func WorkerGroup(
 	waitReady <-chan struct{},
 	signalReady chan<- struct{},
 	epoch *sessionEpoch,
+	probe *pathProbe,
 ) {
 	// Каскадный запуск: ждем свою очередь
 	if waitReady != nil {
@@ -181,7 +182,7 @@ func WorkerGroup(
 				// не выбрасывает воркер (см. epoch.go).
 				epochCtx := epoch.current()
 				configDelivered, sessErr := RunSession(epochCtx, tp, peer, d, localPort,
-					getConf, cc, wid, &credsSnapshot, deviceID, password, stats, allocateTicker.C)
+					getConf, cc, wid, &credsSnapshot, deviceID, password, stats, allocateTicker.C, probe)
 
 				if ctx.Err() != nil {
 					return

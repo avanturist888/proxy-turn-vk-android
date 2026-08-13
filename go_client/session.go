@@ -177,6 +177,7 @@ func RunSession(
 	deviceID, password string,
 	stats *Stats,
 	allocateGate <-chan time.Time,
+	probe *pathProbe,
 ) (bool, error) {
 	configDelivered := false
 	var firstWrapUp uint32
@@ -514,7 +515,7 @@ func RunSession(
 
 	// Proxy activeConn ↔ Dispatcher
 	var proxyWg sync.WaitGroup
-	proxyWg.Add(3) // +1 for keepalive goroutine
+	proxyWg.Add(4) // Reader + Writer + keepalive + проба пути
 
 	stopConn := context.AfterFunc(sessCtx, func() {
 		_ = activeConn.SetDeadline(time.Now())
@@ -543,30 +544,61 @@ func RunSession(
 	// конкурирующая за conn с основным Writer'ом ниже) — кладётся в
 	// slot.PrioCh неблокирующе, тем же путём, что и мелкие ACK-пакеты, и
 	// уходит через единственную writer-горутину.
+	didBytes := make([]byte, 16)
+	copy(didBytes, deviceID)
+
+	// sendKeepalive возвращает true, если пакет действительно поставлен в
+	// очередь на отправку. Проба опирается именно на факт отправки: не
+	// отправленный keepalive не даёт права считать путь мёртвым.
+	sendKeepalive := func() bool {
+		size := keepaliveMinSize + rand.Intn(keepaliveMaxSize)
+		pkt := getPktBuf(size)
+		pkt[0] = keepaliveByte
+		copy(pkt[1:17], didBytes)
+		for i := 17; i < size; i++ {
+			pkt[i] = keepaliveByte
+		}
+		select {
+		case slot.PrioCh <- pkt:
+			return true
+		default:
+			putPktBuf(pkt)
+			return false
+		}
+	}
+
+	// probeSentAt — момент отправки пробного keepalive (unix ms, 0 — пробы не
+	// было). Reader считает путь мёртвым, только если после этой отправки
+	// ничего не пришло дольше sessionProbeTimeout.
+	var probeSentAt atomic.Int64
+
 	go func() {
 		defer proxyWg.Done()
 		t := time.NewTicker(keepaliveInterval)
 		defer t.Stop()
-
-		didBytes := make([]byte, 16)
-		copy(didBytes, deviceID)
 
 		for {
 			select {
 			case <-sessCtx.Done():
 				return
 			case <-t.C:
-				size := keepaliveMinSize + rand.Intn(keepaliveMaxSize)
-				pkt := getPktBuf(size)
-				pkt[0] = keepaliveByte
-				copy(pkt[1:17], didBytes)
-				for i := 17; i < size; i++ {
-					pkt[i] = keepaliveByte
-				}
-				select {
-				case slot.PrioCh <- pkt:
-				default:
-					putPktBuf(pkt)
+				sendKeepalive()
+			}
+		}
+	}()
+
+	// Проба пути по запросу извне (смена сети): шлём keepalive немедленно,
+	// не дожидаясь тика, и отмечаем время — дальше судит Reader.
+	go func() {
+		defer proxyWg.Done()
+		for {
+			ch := probe.wait()
+			select {
+			case <-sessCtx.Done():
+				return
+			case <-ch:
+				if sendKeepalive() {
+					probeSentAt.Store(time.Now().UnixMilli())
 				}
 			}
 		}
@@ -652,7 +684,23 @@ func RunSession(
 					return
 				}
 				if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
-					if silence := time.Since(lastRecv); serverAnswersPong && silence > sessionSilenceTimeout {
+					if !serverAnswersPong {
+						// Сервер не отвечает на keepalive: молчание — не улика
+						// (см. sessionSilenceTimeout).
+						continue
+					}
+					// Проба не прошла: keepalive был отправлен по запросу
+					// после смены сети, а ответа нет — путь мёртв, ждать
+					// полный таймаут тишины незачем.
+					if sentAt := probeSentAt.Load(); sentAt > 0 {
+						sent := time.UnixMilli(sentAt)
+						if lastRecv.Before(sent) && time.Since(sent) > sessionProbeTimeout {
+							log.Printf("[ВОРКЕР #%d] Проба пути без ответа за %s — сессия мертва",
+								sessionID, sessionProbeTimeout)
+							return
+						}
+					}
+					if silence := time.Since(lastRecv); silence > sessionSilenceTimeout {
 						log.Printf("[ВОРКЕР #%d] Тишина %s — сессия мертва, переподключаемся",
 							sessionID, silence.Truncate(time.Second))
 						return
