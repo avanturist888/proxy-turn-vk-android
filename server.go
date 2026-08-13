@@ -2402,7 +2402,16 @@ func handleConnRaw(ctx context.Context, clientConn net.Conn, router *rawRouter) 
 		// IPv4-пакета всегда 0x45 (версия 4, IHL 5) и никогда не 0xFF, так
 		// что разбор по первому байту безопасен для любой длины.
 		if nn > 0 && (*b)[0] == 0xFF {
-			continue // keepalive
+			// Отвечаем pong (см. тот же ответ в handleConn для WG-пути):
+			// без него клиент не может отличить живой путь от чёрной дыры
+			// после смены сети, потому что запись в мёртвый UDP-сокет
+			// часто проходит без ошибки. Идём через downlinkWorker, а не
+			// пишем в clientConn напрямую — запись в conn принадлежит
+			// только его воркер-горутине (см. downlinkWorker.run).
+			pong := getBuf2048()[:1]
+			pong[0] = 0xFF
+			dlWorker.enqueue(pong)
+			continue
 		}
 		if strings.HasPrefix(string((*b)[:nn]), "DISCONNECT_RAW:") {
 			// Клиент явно сообщил об отключении — сразу освобождаем слот,
@@ -3018,6 +3027,11 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 	var proxyWg sync.WaitGroup
 	proxyWg.Add(2)
 
+	// clientWriteMu сериализует запись в clientConn: с появлением pong в
+	// clientConn пишут две горутины — downlink (данные от WG) и uplink
+	// (ответ на keepalive).
+	var clientWriteMu sync.Mutex
+
 	// Клиент → WG
 	go func() {
 		defer proxyWg.Done()
@@ -3040,6 +3054,21 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			// handleConnRaw. WireGuard-пакеты всегда начинаются с байта
 			// типа сообщения 1-4, никогда не 0xFF.
 			if nn > 0 && (*b)[0] == 0xFF {
+				// Отвечаем однобайтовым pong. Транспорт — UDP через TURN
+				// relay: после смены сети (WiFi ↔ LTE) клиентский сокет
+				// остаётся с src-адресом исчезнувшего интерфейса и молча
+				// пишет в никуда — ошибки записи может не быть вовсе.
+				// Ответ на keepalive — единственный признак, по которому
+				// клиент отличает живой путь от чёрной дыры на
+				// простаивающем туннеле (см. sessionSilenceTimeout в
+				// go_client/session.go). Клиенты без поддержки pong
+				// отбрасывают его как неизвестный однобайтовый пакет.
+				clientWriteMu.Lock()
+				_, pongErr := clientConn.Write([]byte{0xFF})
+				clientWriteMu.Unlock()
+				if pongErr != nil {
+					return
+				}
 				continue
 			}
 			atomic.AddInt64(&totalBytesFromClient, int64(nn))
@@ -3080,7 +3109,10 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			if err := downlinkPacer.await(pctx, float64(nn+30)); err != nil {
 				return
 			}
-			if _, err := clientConn.Write((*b)[:nn]); err != nil {
+			clientWriteMu.Lock()
+			_, err = clientConn.Write((*b)[:nn])
+			clientWriteMu.Unlock()
+			if err != nil {
 				return
 			}
 		}

@@ -62,6 +62,20 @@ object TunnelManager {
     private var lastReconnectAtMs = 0L
     private val reconnectMutex = Mutex()
 
+    /**
+     * Секунды тишины из поля «Тишина» строки статистики go_client: сколько
+     * времени от сервера не приходило ничего, включая pong на keepalive.
+     * null — сервер не отвечает на keepalive (старый wdtt-server), измерить
+     * тишину нельзя, работаем по прежней эвристике.
+     *
+     * Нужно потому, что сама строка статистики печатается по таймеру каждые
+     * 3с и живёт, пока жив процесс, — по ней нельзя судить, ходит ли трафик.
+     */
+    private var lastSilenceSeconds: Int? = null
+
+    /** Порог тишины, после которого транспорт считается мёртвым. */
+    private const val TRANSPORT_SILENCE_LIMIT_SEC = 40
+
     private const val STALE_STATS_MS = 90_000L
     private const val HEALTH_CHECK_GRACE_MS = 120_000L
     private const val MIN_RECONNECT_INTERVAL_MS = 10_000L
@@ -318,6 +332,7 @@ object TunnelManager {
             processStartedAtMs = 0L
             lastActiveAtMs = 0L
             lastStatsReceivedAtMs = 0L
+            lastSilenceSeconds = null
             activeHashIndex = 0
             lastContext = java.lang.ref.WeakReference(appContext)
             forceRegenerateUA = false
@@ -807,6 +822,9 @@ object TunnelManager {
                         stats.value = msg
                         lastStatsReceivedAtMs = now
 
+                        lastSilenceSeconds = Regex("Тишина:\\s*(\\d+)").find(msg)
+                            ?.groupValues?.get(1)?.toIntOrNull()
+
                         val match = Regex("Активных:\\s*(\\d+)").find(msg)
                         if (match != null) {
                             val active = match.groupValues[1].toIntOrNull() ?: 0
@@ -1211,7 +1229,11 @@ object TunnelManager {
                     delay(backoffMs)
                     if (running.value) {
                         restartAttempts = (restartAttempts + 1).coerceAtMost(6)
-                        reconnectAll("процесс упал")
+                        // force: watchdog завершает себя следующей строкой и
+                        // рассчитывает, что перезапустит его start() из
+                        // reconnectAll. Отказ по 10-секундному троттлу оставил
+                        // бы туннель вообще без супервизии до конца сеанса.
+                        reconnectAll("процесс упал", force = true)
                     }
                     return@launch // startWatchdog будет перезапущен из start()
                 }
@@ -1233,7 +1255,7 @@ object TunnelManager {
                     } else if (System.currentTimeMillis() - zeroWorkersSince > 90_000 && !ManlCaptchaWebViewManager.isCaptchaPending) {
                         updateLog("watchdog", "⚠ Зомби-процесс (0 воркеров 90с). Перезапуск...", 50, true)
                         forceRegenerateUA = true
-                        reconnectAll("зомби-процесс")
+                        reconnectAll("зомби-процесс", force = true)
                         return@launch
                     }
                 } else {
@@ -1242,12 +1264,13 @@ object TunnelManager {
                     restartAttempts = 0
 
                     val now = System.currentTimeMillis()
-                    if (
-                        processStartedAtMs > 0L &&
+                    val pastGrace = processStartedAtMs > 0L &&
                         now - processStartedAtMs > HEALTH_CHECK_GRACE_MS &&
-                        lastStatsReceivedAtMs > 0L &&
-                        now - lastStatsReceivedAtMs > STALE_STATS_MS &&
                         !ManlCaptchaWebViewManager.isCaptchaPending
+                    if (
+                        pastGrace &&
+                        lastStatsReceivedAtMs > 0L &&
+                        now - lastStatsReceivedAtMs > STALE_STATS_MS
                     ) {
                         updateLog(
                             "health_stale",
@@ -1255,7 +1278,24 @@ object TunnelManager {
                             50,
                             true
                         )
-                        reconnectAll("зависшее соединение")
+                        reconnectAll("зависшее соединение", force = true)
+                        return@launch
+                    }
+
+                    // Транспорт молчит, хотя воркеры числятся активными.
+                    // Ловит разрывы, о которых ConnectivityManager не
+                    // сообщает вовсе (NAT rebind, смена IP внутри той же
+                    // сети): раньше единственным входом в восстановление было
+                    // событие смены сети, и без него туннель висел мёртвым.
+                    val silence = lastSilenceSeconds
+                    if (pastGrace && silence != null && silence >= TRANSPORT_SILENCE_LIMIT_SEC) {
+                        updateLog(
+                            "health_silence",
+                            "⚠ Сервер молчит ${silence}с — переподключение...",
+                            50,
+                            true
+                        )
+                        reconnectAll("транспорт молчит", force = true)
                         return@launch
                     }
                 }
@@ -1269,12 +1309,35 @@ object TunnelManager {
         reconnectAll("смена сети")
     }
 
+    /**
+     * Жив ли транспорт на самом деле.
+     *
+     * Строка `[СТАТИСТИКА]` печатается go_client по таймеру каждые 3с
+     * независимо от трафика, а `Активных` считает существующие объекты
+     * сессий, а не работающие, — поэтому оба признака остаются
+     * «положительными» и на мёртвом после смены сети туннеле. Если сервер
+     * отвечает на keepalive, решение принимаем по фактической тишине; поле
+     * `Тишина` даёт её напрямую из go_client. Для серверов без pong
+     * измерить тишину нечем, и остаётся прежняя (неточная) эвристика.
+     */
+    /**
+     * true, если живость транспорта измеряется достоверно: сервер отвечает
+     * на keepalive и go_client сообщает фактическую тишину. Пока признака
+     * нет, восстановление опирается на догадки и не должно будить устройство
+     * лишний раз — см. гейт по экрану в TunnelService.
+     */
+    val hasReliableLivenessSignal: Boolean
+        get() = lastSilenceSeconds != null
+
     fun hasRecentTransportActivity(maxAgeMs: Long = 25_000L): Boolean {
         val now = System.currentTimeMillis()
-        return running.value &&
+        val processAlive = running.value &&
             activeWorkers.value > 0 &&
             lastStatsReceivedAtMs > 0L &&
             now - lastStatsReceivedAtMs <= maxAgeMs
+        if (!processAlive) return false
+        val silence = lastSilenceSeconds ?: return true
+        return silence < TRANSPORT_SILENCE_LIMIT_SEC
     }
 
     fun reconnectAll(reason: String, force: Boolean = false) {
@@ -1351,6 +1414,12 @@ object TunnelManager {
     private fun killProcess() {
         watchdogJob?.cancel()
         readerJob?.cancel()
+        // Тишина относится к убиваемому процессу: у нового она измеряется
+        // заново, иначе унаследованное значение сразу признает живой
+        // транспорт мёртвым (start() чистит счётчики только при !isSwitching,
+        // а реконнект идёт именно с isSwitching = true).
+        lastSilenceSeconds = null
+        lastStatsReceivedAtMs = 0L
         stopGoProcessGracefully()
     }
 

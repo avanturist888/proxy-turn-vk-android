@@ -22,11 +22,24 @@ import (
 )
 
 const (
-	workerSendBuf      = 128
-	sessionReadTimeout = 30 * time.Minute // Increased from 60s to 30min
-	readBufSize        = 1600
-	socketBufSize      = 625 * 1024
-	keepaliveByte      = 0xFF // keepalive marker (DTLS-level или прямой obfs-кадр)
+	workerSendBuf = 128
+	// sessionReadTimeout — период пробуждения Reader'а, а НЕ таймаут смерти
+	// сессии: по нему Reader лишь получает шанс проверить, как давно от
+	// сервера вообще что-то приходило (см. sessionSilenceTimeout). Раньше
+	// здесь стояло 30 минут, и таймаут обрабатывался через continue — то
+	// есть детекта тишины не было вообще.
+	sessionReadTimeout = 5 * time.Second
+	// sessionSilenceTimeout — сколько подряд можно не получать от сервера
+	// НИЧЕГО (ни данных, ни pong на keepalive), прежде чем считать сессию
+	// мёртвой. Транспорт — UDP через TURN relay: после смены сети
+	// (WiFi ↔ LTE) сокет остаётся с src-адресом исчезнувшего интерфейса и
+	// молча пишет в никуда, ошибки записи при этом может не быть вовсе.
+	// Тишина — единственный надёжный признак такого разрыва. Порог = три
+	// пропущенных keepalive с запасом.
+	sessionSilenceTimeout = 35 * time.Second
+	readBufSize           = 1600
+	socketBufSize         = 625 * 1024
+	keepaliveByte         = 0xFF // keepalive marker (DTLS-level или прямой obfs-кадр)
 	// keepaliveInterval: 1с (как у референсного клиента) — агрессивнее держит
 	// TURN permission/NAT-маппинг "тёплым" на каждом из 18-108 relay-сокетов
 	// сессии, чем прежние 15с/5с.
@@ -624,6 +637,13 @@ func RunSession(
 		defer proxyWg.Done()
 		defer sessCancel()
 		b := make([]byte, 2000)
+		lastRecv := time.Now()
+		// serverAnswersPong — сервер хотя бы раз ответил на keepalive.
+		// Пока этого не случилось, тишина ничего не доказывает: старый
+		// wdtt-server keepalive молча отбрасывает, и на простаивающем
+		// туннеле законно молчит часами. Рвать сессию по тишине можно
+		// только с сервером, от которого мы уже видели pong.
+		serverAnswersPong := false
 		for {
 			_ = activeConn.SetReadDeadline(time.Now().Add(sessionReadTimeout))
 			n, readErr := activeConn.Read(b)
@@ -632,14 +652,24 @@ func RunSession(
 					return
 				}
 				if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
+					if silence := time.Since(lastRecv); serverAnswersPong && silence > sessionSilenceTimeout {
+						log.Printf("[ВОРКЕР #%d] Тишина %s — сессия мертва, переподключаемся",
+							sessionID, silence.Truncate(time.Second))
+						return
+					}
 					continue
 				}
 				log.Printf("[ВОРКЕР #%d] Ошибка Reader: %v", sessionID, readErr)
 				return
 			}
 
+			lastRecv = time.Now()
+			stats.NoteRecv()
+
 			// Skip keepalive pong from server
 			if n == 1 && b[0] == keepaliveByte {
+				serverAnswersPong = true
+				stats.PongSeen.Store(true)
 				continue
 			}
 

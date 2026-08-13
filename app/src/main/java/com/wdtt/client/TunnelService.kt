@@ -30,6 +30,9 @@ import kotlinx.coroutines.flow.collectLatest
 private const val TUNNEL_NOTIFICATION_CHANNEL_ID = NotificationHelper.TUNNEL_CHANNEL_ID
 private const val TUNNEL_NOTIFICATION_ID = 1
 
+/** Минимальный интервал между попытками восстановления транспорта. */
+private const val RECOVERY_ATTEMPT_INTERVAL_MS = 120_000L
+
 class TunnelService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -446,13 +449,25 @@ class TunnelService : Service() {
         }
     }
 
+    /**
+     * Восстановление блокируется выключенным экраном только пока живость
+     * транспорта измеряется недостоверно. Гейт вводился, когда единственным
+     * признаком жизни была строка статистики (она печатается по таймеру и на
+     * мёртвом туннеле тоже), и без него фоновые события сети дёргали
+     * переподключение впустую. С ответом сервера на keepalive признак стал
+     * точным, и туннель, умерший в кармане, чинится, не дожидаясь, пока
+     * пользователь включит экран.
+     */
+    private fun recoveryBlockedByScreenOff(): Boolean =
+        !deviceWasInteractive && !TunnelManager.hasReliableLivenessSignal
+
     private fun scheduleNetworkRecovery() {
         networkRecoveryJob?.cancel()
         networkRecoveryJob = TunnelManager.scope.launch {
-            if (!TunnelManager.running.value || isTunnelPaused || !deviceWasInteractive) return@launch
+            if (!TunnelManager.running.value || isTunnelPaused || recoveryBlockedByScreenOff()) return@launch
             TunnelManager.addNetworkLog("[СЕТЬ] Сеть изменилась. Ждём стабилизации без перезапуска VPN.")
             delay(5_000)
-            if (!TunnelManager.running.value || isTunnelPaused || !deviceWasInteractive ||
+            if (!TunnelManager.running.value || isTunnelPaused || recoveryBlockedByScreenOff() ||
                 System.currentTimeMillis() < wakeGraceUntilMs || !hasValidatedUnderlyingNetwork()) return@launch
             if (TunnelManager.hasRecentTransportActivity()) {
                 TunnelManager.addNetworkLog("[СЕТЬ] Транспорт пережил смену сети без переподключения.")
@@ -460,15 +475,30 @@ class TunnelService : Service() {
             }
             TunnelManager.addNetworkLog("[СЕТЬ] После смены сети нет свежего ответа. Даём транспорту время восстановиться.")
             delay(30_000)
-            if (!TunnelManager.running.value || isTunnelPaused || !deviceWasInteractive ||
+            if (!TunnelManager.running.value || isTunnelPaused || recoveryBlockedByScreenOff() ||
                 System.currentTimeMillis() < wakeGraceUntilMs || !hasValidatedUnderlyingNetwork()) return@launch
             if (TunnelManager.hasRecentTransportActivity()) {
                 TunnelManager.addNetworkLog("[СЕТЬ] Транспорт восстановился без перезапуска.")
                 return@launch
             }
-            val now = System.currentTimeMillis()
-            if (now - lastNetworkRecoveryAttemptMs < 120_000L) return@launch
-            lastNetworkRecoveryAttemptMs = now
+            // Окно 120с между попытками ждём, а не выходим по нему молча:
+            // при быстрой цепочке смен сети (мобильная → Wi-Fi → мобильная)
+            // первое переключение занимало окно, второе отбрасывалось, и
+            // повторно проверить состояние было уже некому — новых событий
+            // от ConnectivityManager не будет, и туннель оставался мёртвым
+            // до ручного переподключения.
+            val sinceLastAttempt = System.currentTimeMillis() - lastNetworkRecoveryAttemptMs
+            if (sinceLastAttempt < RECOVERY_ATTEMPT_INTERVAL_MS) {
+                TunnelManager.addNetworkLog("[СЕТЬ] Недавно уже переподключались — ждём и проверяем ещё раз.")
+                delay(RECOVERY_ATTEMPT_INTERVAL_MS - sinceLastAttempt)
+                if (!TunnelManager.running.value || isTunnelPaused || recoveryBlockedByScreenOff() ||
+                    !hasValidatedUnderlyingNetwork()) return@launch
+                if (TunnelManager.hasRecentTransportActivity()) {
+                    TunnelManager.addNetworkLog("[СЕТЬ] Транспорт восстановился сам, переподключение не нужно.")
+                    return@launch
+                }
+            }
+            lastNetworkRecoveryAttemptMs = System.currentTimeMillis()
             updateNotification("Восстановление соединения...")
             TunnelManager.addNetworkLog("[СЕТЬ] Новая сеть подтверждена, но трафик не восстановился. Мягко переподключаем транспорт.")
             TunnelManager.restartTransport()
@@ -519,9 +549,20 @@ class TunnelService : Service() {
                 TunnelManager.addNetworkLog("[СОН] VPN подал свежие признаки жизни после пробуждения.")
                 return@launch
             }
-            val now = System.currentTimeMillis()
-            if (now - lastNetworkRecoveryAttemptMs < 120_000L) return@launch
-            lastNetworkRecoveryAttemptMs = now
+            // Как и в scheduleNetworkRecovery: окно между попытками ждём,
+            // а не выходим по нему молча — иначе повторно проверить состояние
+            // будет некому до следующего пробуждения.
+            val sinceLastAttempt = System.currentTimeMillis() - lastNetworkRecoveryAttemptMs
+            if (sinceLastAttempt < RECOVERY_ATTEMPT_INTERVAL_MS) {
+                delay(RECOVERY_ATTEMPT_INTERVAL_MS - sinceLastAttempt)
+                if (!deviceWasInteractive || !TunnelManager.running.value || isTunnelPaused ||
+                    !hasValidatedUnderlyingNetwork()) return@launch
+                if (TunnelManager.hasRecentTransportActivity(45_000L)) {
+                    TunnelManager.addNetworkLog("[СОН] VPN восстановился сам, переподключение не нужно.")
+                    return@launch
+                }
+            }
+            lastNetworkRecoveryAttemptMs = System.currentTimeMillis()
             updateNotification("Восстановление после сна...")
             TunnelManager.addNetworkLog("[СОН] VPN не ожил после пробуждения. Мягко переподключаем транспорт.")
             TunnelManager.restartTransport()
