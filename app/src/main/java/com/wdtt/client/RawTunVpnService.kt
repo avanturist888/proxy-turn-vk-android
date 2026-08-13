@@ -245,6 +245,24 @@ class RawTunVpnService : VpnService() {
         tunFd = null
     }
 
+    /**
+     * Сообщает системе, поверх какой сети сейчас работает туннель.
+     *
+     * Без этого Android считает, что VPN висит на сети, актуальной на момент
+     * establish(), и после переезда на другую сеть неверно оценивает его
+     * связность и metered-статус — а по metered приложения внутри туннеля
+     * решают, качать ли обновления и большие файлы.
+     *
+     * null возвращает поведение по умолчанию (система выбирает сама).
+     */
+    fun updateUnderlyingNetwork(network: android.net.Network?) {
+        runCatching {
+            setUnderlyingNetworks(network?.let { arrayOf(it) })
+        }.onFailure {
+            diag("setUnderlyingNetworks failed: $it", isError = true)
+        }
+    }
+
     companion object {
         private const val TAG = "RawTunVpnService"
 

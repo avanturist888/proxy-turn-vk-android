@@ -42,6 +42,9 @@ class TunnelService : Service() {
     // Network Monitoring
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var defaultNetworkCallback: ConnectivityManager.NetworkCallback? = null
+    /** Сеть, на которой сейчас дефолтный маршрут; её смена и ломает транспорт. */
+    private var lastDefaultNetwork: Network? = null
     private var networkRecoveryJob: Job? = null
     private var lastNetworkRecoveryAttemptMs = 0L
     private var screenStateReceiver: BroadcastReceiver? = null
@@ -324,7 +327,14 @@ class TunnelService : Service() {
             override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
                 super.onLinkPropertiesChanged(network, linkProperties)
                 if (network !in activeNetworks) return
-                noteUnderlyingNetworkChange()
+                // Отпечаток надо пересчитать здесь же: noteUnderlyingNetworkChange
+                // сравнивает уже запомненные значения, поэтому без обновления
+                // кеша смена адреса всегда выглядела как отсутствие изменений.
+                val prev = networkFingerprints[network]
+                val next = rememberNetworkFingerprint(network)
+                if (prev != null && prev != next) {
+                    noteUnderlyingNetworkChange()
+                }
             }
         }
 
@@ -336,7 +346,49 @@ class TunnelService : Service() {
             .build()
             
         connectivityManager?.registerNetworkCallback(request, networkCallback!!)
+        setupDefaultNetworkCallback()
         wasOnWifi = isUnderlyingWifiActive()
+    }
+
+    /**
+     * Отдельный слушатель дефолтной сети.
+     *
+     * Транспорт ломает переезд именно дефолтного маршрута, а обычный колбэк
+     * выше видит лишь набор доступных сетей. В сценарии «мобильная → Wi-Fi»
+     * набор не меняется — мобильная остаётся живой, пока поднимается Wi-Fi, —
+     * поэтому смена дефолта могла вообще не породить события, и восстановление
+     * начиналось только когда транспорт замолкал.
+     */
+    private fun setupDefaultNetworkCallback() {
+        val cm = connectivityManager ?: return
+        defaultNetworkCallback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                super.onAvailable(network)
+                val previous = lastDefaultNetwork
+                lastDefaultNetwork = network
+                // Для raw-режима сообщаем системе, поверх чего теперь идёт
+                // туннель. В режиме WireGuard тот же вызов недоступен: TUN
+                // поднимает VpnService из библиотеки GoBackend, до которого
+                // публичного API нет.
+                RawTunVpnService.instance?.updateUnderlyingNetwork(network)
+                if (previous != null && previous != network) {
+                    TunnelManager.addNetworkLog("[СЕТЬ] Сменился основной маршрут — проверяем туннель.")
+                    handleNetworkChange()
+                }
+            }
+
+            override fun onLost(network: Network) {
+                super.onLost(network)
+                if (lastDefaultNetwork == network) {
+                    lastDefaultNetwork = null
+                }
+            }
+        }
+        runCatching { cm.registerDefaultNetworkCallback(defaultNetworkCallback!!) }
+            .onFailure {
+                defaultNetworkCallback = null
+                Log.w("TunnelService", "Не удалось подписаться на дефолтную сеть: ${it.message}")
+            }
     }
 
     /**
@@ -375,10 +427,29 @@ class TunnelService : Service() {
         return "$transports|validated=$validated|internet=$internet"
     }
 
+    /**
+     * Адреса интерфейса — часть отпечатка наравне с capabilities.
+     *
+     * Без них смена IP внутри той же сети (перевыдача по DHCP, NAT rebind,
+     * переезд между точками одного Wi-Fi) не отличалась от «ничего не
+     * произошло»: capabilities те же, отпечаток тот же, и обработчик
+     * onLinkPropertiesChanged выходил, не сделав ничего. Транспорт при этом
+     * ломается ровно так же, как при смене сети.
+     */
+    private fun networkAddressFingerprint(network: Network): String {
+        val cm = connectivityManager ?: return ""
+        val lp = cm.getLinkProperties(network) ?: return ""
+        return lp.linkAddresses
+            .mapNotNull { it.address.hostAddress }
+            .sorted()
+            .joinToString(",")
+    }
+
     private fun rememberNetworkFingerprint(network: Network): String {
         val cm = connectivityManager ?: return ""
         val caps = cm.getNetworkCapabilities(network) ?: return ""
-        val fingerprint = networkCapabilityFingerprint(caps)
+        val fingerprint = networkCapabilityFingerprint(caps) +
+            "|addr=" + networkAddressFingerprint(network)
         networkFingerprints[network] = fingerprint
         return fingerprint
     }
@@ -782,6 +853,9 @@ class TunnelService : Service() {
         screenStateReceiver?.let { unregisterReceiver(it) }
         networkCallback?.let {
             connectivityManager?.unregisterNetworkCallback(it)
+        }
+        defaultNetworkCallback?.let {
+            runCatching { connectivityManager?.unregisterNetworkCallback(it) }
         }
         stopTunnel()
     }
