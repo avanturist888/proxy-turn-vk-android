@@ -19,6 +19,12 @@ const workersPerGroup = 9
 // WorkerGroup). Тот же порядок величины, что у free-turn-proxy (200ms).
 const allocateGateInterval = 200 * time.Millisecond
 
+// sessionEstablishedFor — сколько сессия должна проработать, чтобы её
+// завершение считалось потерей связи (смена сети), а не неудачной попыткой
+// подключения. Разграничение нужно для выбора паузы перед повтором, см.
+// retryDelay в WorkerGroup.
+const sessionEstablishedFor = 30 * time.Second
+
 // WorkerGroup:
 // Запускает 9 потоков с одними кредами. Ротации нет — работает до смерти воркеров.
 func WorkerGroup(
@@ -181,8 +187,10 @@ func WorkerGroup(
 				// воркера — в контексте процесса: смена сети рвёт сессию, но
 				// не выбрасывает воркер (см. epoch.go).
 				epochCtx := epoch.current()
+				sessStart := time.Now()
 				configDelivered, sessErr := RunSession(epochCtx, tp, peer, d, localPort,
 					getConf, cc, wid, &credsSnapshot, deviceID, password, stats, allocateTicker.C, probe)
+				sessLifetime := time.Since(sessStart)
 
 				if ctx.Err() != nil {
 					return
@@ -271,6 +279,15 @@ func WorkerGroup(
 				retryDelay := time.Duration(5+rand.Intn(11)) * time.Second
 				if quotaRetry {
 					retryDelay = time.Duration(30+rand.Intn(31)) * time.Second
+				} else if sessErr == nil && sessLifetime > sessionEstablishedFor {
+					// Сессия отработала своё и завершилась сама — по пробе
+					// пути или по тишине после смены сети. Это восстановление,
+					// а не отступ после ошибки, и пауза здесь только продлевает
+					// простой. Условие на время жизни удерживает от лавины:
+					// сессии, умирающие сразу после установки (сервер лёг,
+					// пароль не тот), под быстрый повтор не попадают и по-
+					// прежнему ждут полные 5-15с, не выжигая квоту VK.
+					retryDelay = time.Duration(500+rand.Intn(1000)) * time.Millisecond
 				}
 				select {
 				case <-time.After(retryDelay):
