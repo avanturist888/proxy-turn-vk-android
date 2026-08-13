@@ -25,6 +25,25 @@ const allocateGateInterval = 200 * time.Millisecond
 // retryDelay в WorkerGroup.
 const sessionEstablishedFor = 30 * time.Second
 
+// backoffDelay — отступ перед повторной попыткой: 5с, 10с, 20с, 40с и далее
+// потолок в минуту, с джиттером, чтобы девять воркеров группы не бились в VK
+// синхронным залпом. Нужен там, где причина неудачи временная (нет сети,
+// flood control) и повторять стоит, но частить — нельзя.
+func backoffDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	shift := attempt - 1
+	if shift > 4 {
+		shift = 4
+	}
+	d := (5 * time.Second) << shift
+	if d > time.Minute {
+		d = time.Minute
+	}
+	return d + time.Duration(rand.Intn(2000))*time.Millisecond
+}
+
 // WorkerGroup:
 // Запускает 9 потоков с одними кредами. Ротации нет — работает до смерти воркеров.
 func WorkerGroup(
@@ -77,13 +96,32 @@ func WorkerGroup(
 	log.Printf("[ГРУППА #%d] Запрос кредов (хеш: %s...)", groupID, shortHash)
 
 	credStreamID := groupID * 100
-	user, pass, turnURLs, err := GetCreds(ctx, hash, credStreamID)
 	var creds *Credentials
-	if err == nil {
-		creds = &Credentials{User: user, Pass: pass, TurnURLs: turnURLs, CacheStreamID: credStreamID}
-	} else {
-		log.Printf("[ГРУППА #%d] Ошибка кредов: %v", groupID, err)
-		return
+	// Раньше здесь была единственная попытка, и любая неудача убивала всю
+	// группу молча и насовсем: запрос, ушедший в момент смены сети, стоил
+	// девяти воркеров до перезапуска процесса. Повторяем, пока жив процесс,
+	// с растущим отступом — кроме случая, когда сам звонок VK закрыт.
+	for attempt := 1; ; attempt++ {
+		user, pass, turnURLs, err := GetCreds(ctx, hash, credStreamID)
+		if err == nil {
+			creds = &Credentials{User: user, Pass: pass, TurnURLs: turnURLs, CacheStreamID: credStreamID}
+			break
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if status, _ := classifyHashCheckError(err); status == "dead" {
+			log.Printf("[ГРУППА #%d] Звонок закрыт, повторять нечего: %v", groupID, err)
+			return
+		}
+		delay := backoffDelay(attempt)
+		log.Printf("[ГРУППА #%d] Ошибка кредов (попытка %d), повтор через %s: %v",
+			groupID, attempt, delay, err)
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return
+		}
 	}
 
 	log.Printf("[ГРУППА #%d] Креды OK, TURN: %v, %d воркеров", groupID, creds.TurnURLs, len(workerIDs))
@@ -163,6 +201,9 @@ func WorkerGroup(
 
 			shouldGetConfig := getConfig
 			attempt := 0
+			// stallStreak — сколько попыток подряд упёрлось в недоступный
+			// транспорт; задаёт длину отступа перед следующей.
+			stallStreak := 0
 
 			for {
 				if ctx.Err() != nil {
@@ -262,14 +303,24 @@ func WorkerGroup(
 						log.Printf("[ВОРКЕР #%d] Ошибка (попытка %d): %s", wid, attempt, errStr)
 					}
 
-					// Если ошибка STUN (credentials invalid), воркер не сможет переподключиться. Завершаем.
-					isStunDeath := strings.Contains(errStrLower, "error 29") ||
-						strings.Contains(errStrLower, "cannot create socket")
-
-					if isStunDeath {
-						log.Printf("[ВОРКЕР #%d] Невосстановимая TURN/STUN ошибка, завершение: %s", wid, errStr)
-						return
+					// Ошибки, которые выглядят фатальными, но почти всегда
+					// временные: "cannot create socket" возвращает
+					// net.DialUDP ровно в момент смены сети, когда старый
+					// интерфейс уже исчез, а новый ещё не поднялся, а
+					// "error 29" — flood control VK, который отпускает сам.
+					// Раньше воркер на них завершался навсегда; если так
+					// выпадала вся группа, восстанавливать туннель после
+					// смены сети было уже некому. Отступаем и пробуем снова.
+					if strings.Contains(errStrLower, "error 29") ||
+						strings.Contains(errStrLower, "cannot create socket") {
+						stallStreak++
+						log.Printf("[ВОРКЕР #%d] Транспорт недоступен (подряд %d), отступаем: %s",
+							wid, stallStreak, errStr)
+					} else {
+						stallStreak = 0
 					}
+				} else {
+					stallStreak = 0
 				}
 
 				if ctx.Err() != nil {
@@ -279,6 +330,8 @@ func WorkerGroup(
 				retryDelay := time.Duration(5+rand.Intn(11)) * time.Second
 				if quotaRetry {
 					retryDelay = time.Duration(30+rand.Intn(31)) * time.Second
+				} else if stallStreak > 0 {
+					retryDelay = backoffDelay(stallStreak)
 				} else if sessErr == nil && sessLifetime > sessionEstablishedFor {
 					// Сессия отработала своё и завершилась сама — по пробе
 					// пути или по тишине после смены сети. Это восстановление,
