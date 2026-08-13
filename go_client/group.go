@@ -37,6 +37,7 @@ func WorkerGroup(
 	stats *Stats,
 	waitReady <-chan struct{},
 	signalReady chan<- struct{},
+	epoch *sessionEpoch,
 ) {
 	// Каскадный запуск: ждем свою очередь
 	if waitReady != nil {
@@ -175,8 +176,27 @@ func WorkerGroup(
 				credsSnapshot.TurnURLs = cloneStringSlice(creds.TurnURLs)
 				credsMu.RUnlock()
 
-				configDelivered, sessErr := RunSession(ctx, tp, peer, d, localPort,
+				// Сессия живёт в контексте текущего поколения, а сам цикл
+				// воркера — в контексте процесса: смена сети рвёт сессию, но
+				// не выбрасывает воркер (см. epoch.go).
+				epochCtx := epoch.current()
+				configDelivered, sessErr := RunSession(epochCtx, tp, peer, d, localPort,
 					getConf, cc, wid, &credsSnapshot, deviceID, password, stats, allocateTicker.C)
+
+				if ctx.Err() != nil {
+					return
+				}
+				// Поколение сменилось — сессия оборвана намеренно, это не
+				// ошибка воркера. Поднимаем новую сразу: маршруты уже
+				// переехали на новую сеть, ждать 5-15с нечего, а счётчик
+				// попыток наращивать не за что.
+				if epochCtx.Err() != nil {
+					if getConf {
+						atomic.StoreInt32(&configRequestInFlight, 0)
+					}
+					log.Printf("[ВОРКЕР #%d] Сеть сменилась — пересоздаём сессию", wid)
+					continue
+				}
 
 				quotaRetry := false
 				if getConf {

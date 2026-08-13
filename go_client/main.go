@@ -133,7 +133,12 @@ func main() {
 
 	var pauseFlag int32
 
-	// STDIN для PAUSE/RESUME/STOP и CAPTCHA_RESULT
+	// Поколение сессий: RECONNECT рвёт текущие сессии, не трогая процесс и
+	// его кеши (см. epoch.go). Создаётся до чтения stdin, чтобы команда,
+	// пришедшая до старта воркеров, не наткнулась на nil.
+	epoch := newSessionEpoch(ctx)
+
+	// STDIN для PAUSE/RESUME/STOP/RECONNECT и CAPTCHA_RESULT
 	go func() {
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
@@ -149,6 +154,13 @@ func main() {
 			case line == "STOP":
 				cancel()
 				return
+			case line == "RECONNECT":
+				// Мягкое переподключение после смены сети: рвём сессии,
+				// сохраняя кеш TURN-кредов VK, диспетчер и TUN-fd. Жёсткий
+				// перезапуск процесса остаётся у Kotlin как фолбэк, если
+				// это не помогло.
+				log.Printf("[КЛИЕНТ] RECONNECT: пересоздаём сессии, процесс не перезапускаем")
+				epoch.rotate()
 			case strings.HasPrefix(line, "CAPTCHA_RESULT|"):
 				result := strings.TrimPrefix(line, "CAPTCHA_RESULT|")
 				drainCaptchaResult()
@@ -500,7 +512,7 @@ func main() {
 		go func(groupID int, isFirstGroup bool, configChan chan<- string, workerIds []int, startHashIndex int, waitR <-chan struct{}, sigR chan<- struct{}) {
 			defer wg.Done()
 			WorkerGroup(ctx, groupID, startHashIndex, tp, peer, disp, localPort,
-				isFirstGroup, configChan, workerIds, &pauseFlag, *deviceID, *connPassword, stats, waitR, sigR)
+				isFirstGroup, configChan, workerIds, &pauseFlag, *deviceID, *connPassword, stats, waitR, sigR, epoch)
 		}(gID, isFirst, cc, ids, g, myWaitReady, mySignalReady)
 	}
 

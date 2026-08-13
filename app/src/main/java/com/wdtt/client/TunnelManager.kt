@@ -76,6 +76,18 @@ object TunnelManager {
     /** Порог тишины, после которого транспорт считается мёртвым. */
     private const val TRANSPORT_SILENCE_LIMIT_SEC = 40
 
+    /**
+     * Сколько ждать результата мягкого переподключения, прежде чем
+     * эскалировать до перезапуска процесса. К моменту мягкой попытки тишина
+     * уже около порога, а на пересоздание сессий уходит ещё несколько секунд —
+     * без этой форы watchdog обрывал бы мягкое восстановление ровно тогда,
+     * когда оно почти сработало.
+     */
+    private const val SOFT_RECONNECT_GRACE_MS = 45_000L
+
+    /** Когда последний раз просили go_client пересоздать сессии; 0 — не просили. */
+    private var softReconnectAtMs = 0L
+
     private const val STALE_STATS_MS = 90_000L
     private const val HEALTH_CHECK_GRACE_MS = 120_000L
     private const val MIN_RECONNECT_INTERVAL_MS = 10_000L
@@ -1288,7 +1300,11 @@ object TunnelManager {
                     // сети): раньше единственным входом в восстановление было
                     // событие смены сети, и без него туннель висел мёртвым.
                     val silence = lastSilenceSeconds
-                    if (pastGrace && silence != null && silence >= TRANSPORT_SILENCE_LIMIT_SEC) {
+                    val softReconnectPending = softReconnectAtMs > 0L &&
+                        now - softReconnectAtMs < SOFT_RECONNECT_GRACE_MS
+                    if (pastGrace && !softReconnectPending &&
+                        silence != null && silence >= TRANSPORT_SILENCE_LIMIT_SEC
+                    ) {
                         updateLog(
                             "health_silence",
                             "⚠ Сервер молчит ${silence}с — переподключение...",
@@ -1305,8 +1321,40 @@ object TunnelManager {
         }
     }
 
+    /**
+     * Восстановление после смены сети.
+     *
+     * Сначала пробуем мягко: go_client рвёт TURN-сессии и поднимает новые, не
+     * перезапускаясь. Перезапуск процесса выбрасывает кеш TURN-кредов VK, и
+     * каждое восстановление превращается в новый заход в VK-звонок — при
+     * частых переключениях сети это прямой путь к капче и flood control.
+     * Заодно уцелевают диспетчер с выученным адресом локального WireGuard и
+     * TUN-fd, так что сам туннель не пересоздаётся.
+     *
+     * Если мягкое не помогло, тишина никуда не денется и watchdog эскалирует
+     * до полного перезапуска (ветка «транспорт молчит»).
+     */
     fun restartTransport() {
+        if (sendSoftReconnect()) {
+            updateLog("soft_reconnect", "🔄 Пересоздаём сессии после смены сети…", 50, false)
+            return
+        }
         reconnectAll("смена сети")
+    }
+
+    /** Просит go_client пересоздать сессии. false — процесса нет или команда не ушла. */
+    private fun sendSoftReconnect(): Boolean {
+        val proc = process ?: return false
+        if (!proc.isAlive) return false
+        return try {
+            proc.outputStream.write("RECONNECT\n".toByteArray(Charsets.UTF_8))
+            proc.outputStream.flush()
+            softReconnectAtMs = System.currentTimeMillis()
+            true
+        } catch (e: Exception) {
+            updateLog("soft_reconnect_err", "[СЕТЬ] Мягкое переподключение не прошло: ${e.message}", 200, true)
+            false
+        }
     }
 
     /**
@@ -1420,6 +1468,7 @@ object TunnelManager {
         // а реконнект идёт именно с isSwitching = true).
         lastSilenceSeconds = null
         lastStatsReceivedAtMs = 0L
+        softReconnectAtMs = 0L
         stopGoProcessGracefully()
     }
 
