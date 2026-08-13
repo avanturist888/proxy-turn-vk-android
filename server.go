@@ -52,7 +52,12 @@ const (
 	wgServerCIDR          = wgServerAddr + "/16"
 	defaultInternalWGPort = 56001
 	wgMTU                 = 1280
-	keepalive             = 25
+	// keepalive — PersistentKeepalive в выдаваемом клиенту конфиге. После
+	// восстановления транспорта туннель оживает не раньше, чем WireGuard
+	// пошлёт очередной keepalive, поэтому 25с прибавлялись к простою при
+	// каждой смене сети. Секунды трафика в обмен на вдвое более быстрое
+	// возвращение связи.
+	keepalive = 10
 
 	// Raw-IP роутер (без WireGuard) — отдельный TUN/подсеть/NAT, полностью
 	// параллельно WG-пути. Подсеть намеренно не пересекается с wgServerCIDR.

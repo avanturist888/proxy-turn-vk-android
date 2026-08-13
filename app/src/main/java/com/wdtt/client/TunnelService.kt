@@ -633,6 +633,9 @@ class TunnelService : Service() {
         wakeRecoveryJob = TunnelManager.scope.launch {
             if (!TunnelManager.running.value || isTunnelPaused) return@launch
             TunnelManager.addNetworkLog("[СОН] Устройство проснулось; даём текущему VPN восстановиться без перезапуска.")
+            // Пока спали, сеть могла смениться без единого события. Проверяем
+            // путь активно, а не ждём полминуты, чтобы узнать это по молчанию.
+            TunnelManager.probeTransport()
             delay(30_000)
             if (!deviceWasInteractive || !TunnelManager.running.value || isTunnelPaused || !hasValidatedUnderlyingNetwork()) return@launch
             if (TunnelManager.hasRecentTransportActivity(45_000L)) {

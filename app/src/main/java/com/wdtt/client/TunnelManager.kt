@@ -1442,7 +1442,14 @@ object TunnelManager {
                     }
                     withContext(Dispatchers.Main) {
                         if (config.value != null && params.isSocksMode.not() && !params.isRawTunMode) {
-                            wgHelper?.reloadTunnel()
+                            // Пересоздаём WireGuard только если он и правда
+                            // лежит. Его пир смотрит в 127.0.0.1 и смены сети
+                            // не замечает — переподнятый go_client он находит
+                            // сам, — а лишний перезапуск стоит нового
+                            // хендшейка и потери пакетов на это время.
+                            if (wgHelper?.watchdogState() != WireGuardHelper.WatchdogState.UP) {
+                                wgHelper?.reloadTunnel()
+                            }
                         }
                     }
                     start(context, params, isSwitching = true)
