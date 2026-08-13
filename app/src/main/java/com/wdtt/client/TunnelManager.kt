@@ -501,6 +501,15 @@ object TunnelManager {
                     cmd.add("-turn-tcp")
                 }
 
+                if (params.vkAuthMode.equals("anonymous", ignoreCase = true)) {
+                    // Кеш анонимных TURN-кредов переживает перезапуск процесса:
+                    // без него каждый полный рестарт — новый заход в звонок VK,
+                    // то есть лишний шанс словить капчу или flood control.
+                    // Режим аккаунта в этом не нуждается, у него свой файл.
+                    cmd.add("-creds-cache-file")
+                    cmd.add(java.io.File(context.filesDir, "vk_creds_cache.json").absolutePath)
+                }
+
                 val mode = SettingsStore.normalizeConnectionMode(params.connectionMode)
                 cmd.add("-mode")
                 when {

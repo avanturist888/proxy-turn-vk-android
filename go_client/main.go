@@ -199,6 +199,7 @@ func main() {
 	vkAuthMode := flag.String("vk-auth", "anonymous", "режим VK авторизации (account/anonymous)")
 	vkAnonPath := flag.String("vk-anon-path", "vkcalls", "анонимный путь VK TURN (vkcalls/legacy)")
 	vkCredsFile := flag.String("vk-creds-file", "", "файл с TURN кредами от аккаунта VK")
+	credsCacheFile := flag.String("creds-cache-file", "", "файл кеша анонимных TURN-кредов (переживает перезапуск, экономит заходы в звонок VK)")
 	goDNS := flag.String("go-dns", "yandex", "DNS для VK (yandex/cloudflare/google, doh-yandex/doh-cloudflare/doh-google, custom:IP или doh:URL)")
 	obfsMode := flag.String("obfs", "audio", "режим обфускации (audio/video)")
 	checkHashes := flag.Bool("check-hashes", false, "проверить VK-хеши и выйти")
@@ -220,6 +221,15 @@ func main() {
 
 	if err := loadVkCredsFile(*vkCredsFile); err != nil {
 		log.Fatalf("[КЛИЕНТ] Ошибка чтения vk-creds-file: %v", err)
+	}
+
+	if *credsCacheFile != "" {
+		if err := ensureCredsStoreDir(*credsCacheFile); err != nil {
+			log.Printf("[КРЕДЫ] Директория кеша недоступна (%v), работаем без него", err)
+		} else {
+			setCredsStorePath(*credsCacheFile)
+			loadCredsStore()
+		}
 	}
 
 	hashes := ParseHashes(*vkHash)

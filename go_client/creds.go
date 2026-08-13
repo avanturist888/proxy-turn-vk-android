@@ -264,6 +264,9 @@ func getVkCredsCached(ctx context.Context, link string, streamID int) (string, s
 		ExpiresAt:   time.Now().Add(credentialLifetime - cacheSafetyMargin),
 		Link:        link,
 	}
+	// Кладём на диск, чтобы перезапуск процесса не стоил нового захода в
+	// звонок VK (см. creds_store.go).
+	go saveCredsStore()
 	return user, pass, cloneStringSlice(addrs), nil
 }
 
