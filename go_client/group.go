@@ -210,6 +210,19 @@ func WorkerGroup(
 					return
 				}
 
+				// Пауза (сети нет): попытки подключиться всё равно обречены и
+				// только жгут квоту VK и батарею. Раньше флаг проверялся
+				// единственный раз до запуска воркеров и на уже работающие не
+				// влиял, поэтому паузу приходилось изображать убийством всего
+				// процесса — вместе с кешем TURN-кредов.
+				for atomic.LoadInt32(pauseFlag) != 0 {
+					select {
+					case <-time.After(time.Second):
+					case <-ctx.Done():
+						return
+					}
+				}
+
 				getConf := false
 				if shouldGetConfig && atomic.LoadInt32(&configSent) == 0 {
 					getConf = atomic.CompareAndSwapInt32(&configRequestInFlight, 0, 1)

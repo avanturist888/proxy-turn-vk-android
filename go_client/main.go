@@ -152,6 +152,10 @@ func main() {
 			switch {
 			case line == "PAUSE":
 				atomic.StoreInt32(&pauseFlag, 1)
+				// Сеть пропала — текущие сессии уже мертвы. Обрываем их
+				// сразу, чтобы воркеры встали на паузу, а не висели в
+				// ожидании таймаутов на несуществующем пути.
+				epoch.rotate()
 			case line == "RESUME":
 				atomic.StoreInt32(&pauseFlag, 0)
 			case line == "STOP":

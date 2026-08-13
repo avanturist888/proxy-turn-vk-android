@@ -88,6 +88,14 @@ object TunnelManager {
     /** Когда последний раз просили go_client пересоздать сессии; 0 — не просили. */
     private var softReconnectAtMs = 0L
 
+    /**
+     * Транспорт намеренно остановлен из-за отсутствия сети. Отсутствие
+     * воркеров и молчание сервера в этом состоянии ожидаемы и не должны
+     * приниматься watchdog'ом за поломку.
+     */
+    @Volatile
+    private var transportPaused = false
+
     private const val STALE_STATS_MS = 90_000L
     private const val HEALTH_CHECK_GRACE_MS = 120_000L
     private const val MIN_RECONNECT_INTERVAL_MS = 10_000L
@@ -594,6 +602,9 @@ object TunnelManager {
                 wrapAuthTimeoutCount = 0
                 lastActiveAtMs = 0L
                 lastStatsReceivedAtMs = System.currentTimeMillis()
+                // Свежий процесс начинает работать сразу: унаследованный флаг
+                // паузы навсегда усыпил бы и его, и watchdog.
+                transportPaused = false
                 if (!isSwitching) {
                     transportRestartInProgress = false
                 }
@@ -1231,6 +1242,14 @@ object TunnelManager {
             var zeroWorkersSince = 0L
             delay(10_000) // Даём 10 сек на старт
             while (isActive && running.value) {
+                // На паузе воркеров нет и сервер молчит — это норма, а не
+                // повод перезапускать процесс: перезапуск как раз и выбросил
+                // бы кеш кредов, ради сохранения которого пауза и сделана.
+                if (transportPaused) {
+                    zeroWorkersSince = 0L
+                    delay(5_000)
+                    continue
+                }
                 val proc = process
                 if (proc == null || !proc.isAlive) {
                     // Go-процесс мёртв! применяем экспоненциальный бэкофф перед перезапуском
@@ -1352,30 +1371,19 @@ object TunnelManager {
      * отличие от переподключения, которое рвёт и уцелевшие.
      */
     fun probeTransport() {
-        val proc = process ?: return
-        if (!proc.isAlive) return
-        try {
-            proc.outputStream.write("PROBE\n".toByteArray(Charsets.UTF_8))
-            proc.outputStream.flush()
-        } catch (_: Exception) {
-            // Молча: проба — оптимизация, а не обязательный шаг. Если процесс
-            // недоступен, туннель починят обычные пути восстановления.
-        }
+        // Молча: проба — оптимизация, а не обязательный шаг. Если процесс
+        // недоступен, туннель починят обычные пути восстановления.
+        sendCommand("PROBE")
     }
 
     /** Просит go_client пересоздать сессии. false — процесса нет или команда не ушла. */
     private fun sendSoftReconnect(): Boolean {
-        val proc = process ?: return false
-        if (!proc.isAlive) return false
-        return try {
-            proc.outputStream.write("RECONNECT\n".toByteArray(Charsets.UTF_8))
-            proc.outputStream.flush()
-            softReconnectAtMs = System.currentTimeMillis()
-            true
-        } catch (e: Exception) {
-            updateLog("soft_reconnect_err", "[СЕТЬ] Мягкое переподключение не прошло: ${e.message}", 200, true)
-            false
+        if (!sendCommand("RECONNECT")) {
+            updateLog("soft_reconnect_err", "[СЕТЬ] Мягкое переподключение не прошло, перезапускаем процесс", 200, true)
+            return false
         }
+        softReconnectAtMs = System.currentTimeMillis()
+        return true
     }
 
     /**
@@ -1456,14 +1464,46 @@ object TunnelManager {
         }
     }
 
+    /**
+     * Пауза на время полного отсутствия сети.
+     *
+     * Раньше здесь убивался процесс, а вместе с ним — кеш TURN-кредов VK,
+     * поэтому возвращение сети означало новый заход в звонок со всеми рисками
+     * капчи и flood control. Теперь процесс просто перестаёт пытаться:
+     * сессии обрываются, воркеры ждут. Убийство осталось запасным путём на
+     * случай, если процесс не отвечает.
+     */
     fun pause() {
         if (!running.value) return
-        killProcess() // Не ставим running=false, чтоб сервис не умер
+        transportPaused = true
+        if (!sendCommand("PAUSE")) {
+            killProcess() // Не ставим running=false, чтоб сервис не умер
+        }
         activeWorkers.value = 0
     }
 
     fun resume() {
+        transportPaused = false
+        // Процесс пережил паузу — достаточно снять флаг, воркеры поднимут
+        // сессии сами, не переспрашивая у VK учётные данные.
+        if (process?.isAlive == true && sendCommand("RESUME")) {
+            updateLog("resume", "🔄 Сеть вернулась, поднимаем сессии…", 50, false)
+            return
+        }
         reconnectAll("сеть появилась", force = true)
+    }
+
+    /** Отправляет однострочную команду в stdin go_client. */
+    private fun sendCommand(command: String): Boolean {
+        val proc = process ?: return false
+        if (!proc.isAlive) return false
+        return try {
+            proc.outputStream.write("$command\n".toByteArray(Charsets.UTF_8))
+            proc.outputStream.flush()
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private suspend fun awaitRawTunReady(timeoutMs: Long = 20_000L) {
