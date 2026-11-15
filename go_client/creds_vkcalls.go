@@ -11,6 +11,7 @@ import (
 	neturl "net/url"
 	"os"
 	"strings"
+	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
