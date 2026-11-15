@@ -13,10 +13,15 @@ class AlwaysOnVpnService : GoBackend.VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        if (intent == null || intent.action == VpnService.SERVICE_INTERFACE) {
+        val systemStart = intent?.action == VpnService.SERVICE_INTERFACE ||
+            (android.os.Build.VERSION.SDK_INT >= 29 && isAlwaysOn)
+        if (systemStart) RecoveryIntentStore.setRequested(this, true)
+        val requested = RecoveryIntentStore.requested(this)
+        if (shouldResumeConnection(systemStart, intent == null, requested)) {
             TunnelControl.startAutomatic(applicationContext)
         }
-        return START_STICKY
+        if (intent == null && !requested) stopSelf()
+        return if (requested) START_STICKY else START_NOT_STICKY
     }
 
     override fun onDestroy() {

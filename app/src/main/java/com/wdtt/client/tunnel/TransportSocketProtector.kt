@@ -9,15 +9,16 @@ import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.withTimeout
 
 /** Per-socket transport exception; never excludes the application's UID. */
 object TransportSocketProtector {
     // A WireGuard reconfiguration recreates VpnService. Existing Go processes
     // must reconnect to the new owner using the same private endpoint name.
     private val endpointName = "wdtt_protect_${UUID.randomUUID()}"
-    @Volatile private var service: VpnService? = null
+    private val owners = OwnerLifetime<VpnService>()
+    private var service: VpnService?
+        get() = owners.current
+        set(value) { owners.replace(value) }
     @Volatile private var socketName: String? = null
     private var server: LocalServerSocket? = null
     private var listener: Job? = null
@@ -59,9 +60,7 @@ object TransportSocketProtector {
 
     /** Completion is published only after GoBackend's onDestroy resets its future. */
     suspend fun awaitOwnerReleased(owner: VpnService) {
-        withTimeout(3000) {
-            while (service === owner) delay(25)
-        }
+        owners.awaitReleased(owner)
     }
 
     @Synchronized fun stop(owner: VpnService) {

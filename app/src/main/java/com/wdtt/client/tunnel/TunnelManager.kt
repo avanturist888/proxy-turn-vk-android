@@ -66,7 +66,7 @@ object TunnelManager {
     private var lastReconnectAtMs = 0L
     private val reconnectMutex = Mutex()
     private val controlPlane = ControlPlaneBootstrap()
-    private val connectionGeneration = java.util.concurrent.atomic.AtomicLong()
+    private val connectionGeneration = SessionGeneration()
     val controlPlaneBootstrapInProgress: Boolean get() = controlPlane.active
     @Volatile private var keepWireGuardOnNextConfig = false
     @Volatile private var preservedWireGuardConfig: String? = null
@@ -108,6 +108,8 @@ object TunnelManager {
      */
     val lastFatalError = MutableStateFlow<String?>(null)
     val config = MutableStateFlow<String?>(null)
+    @Volatile private var configuredGeneration = -1L
+    fun hasSessionVpn(): Boolean = configuredGeneration == connectionGeneration.get() && running.value
     val stats = MutableStateFlow("Ожидание данных...")
     val activeWorkers = MutableStateFlow(0)
     val isReconnecting = MutableStateFlow(false)
@@ -133,6 +135,9 @@ object TunnelManager {
     val cooldownSeconds = MutableStateFlow(0)
     private var cooldownJob: Job? = null
     private var startJob: Job? = null
+    private var reconnectJob: Job? = null
+    @Volatile private var interactiveAuth = true
+    @Volatile private var retiringWarmOwner: android.net.VpnService? = null
     private var stopJob: Job? = null
     private var pipelineHideJob: Job? = null
     private var pipelineStepTimeoutJob: Job? = null
@@ -283,15 +288,16 @@ object TunnelManager {
         }
     }
 
-    fun start(context: Context, params: TunnelParams, isSwitching: Boolean = false, forceStart: Boolean = false) {
-        android.util.Log.d("WDTT", "TunnelManager.start() called. isSwitching=$isSwitching, forceStart=$forceStart, running=${running.value}, connecting=${isConnecting.value}")
+    fun start(context: Context, params: TunnelParams, isSwitching: Boolean = false, forceStart: Boolean = false, expectedGeneration: Long? = null, allowInteractiveAuth: Boolean = true): Long? {
         synchronized(startGate) {
-            if (running.value && !isSwitching) return
-            // Повторный START (сервис/UI) не должен убивать текущий вход в звонок.
-            if (!isSwitching && startJob?.isActive == true) {
-                android.util.Log.d("WDTT", "start() ignored: connect already in progress")
-                return
-            }
+        // Accepted starts and Stop are atomic; suspended work carries this epoch.
+        if (expectedGeneration != null && connectionGeneration.get() != expectedGeneration) return null
+        android.util.Log.d("WDTT", "TunnelManager.start() called. isSwitching=$isSwitching, forceStart=$forceStart, running=${running.value}, connecting=${isConnecting.value}")
+        if (running.value && !isSwitching) return null
+        // Повторный START (сервис/UI) не должен убивать текущий вход в звонок.
+        if (!isSwitching && startJob?.isActive == true) {
+            android.util.Log.d("WDTT", "start() ignored: connect already in progress")
+            return null
         }
         
         val appContext = context.applicationContext // Защита от Memory Leak
@@ -344,20 +350,17 @@ object TunnelManager {
         
         wgHelper = WireGuardHelper(appContext)
 
-        synchronized(startGate) {
-            if (!isSwitching && startJob?.isActive == true) {
-                android.util.Log.d("WDTT", "start() ignored after prepare: already in progress")
-                return
-            }
+            val generation = connectionGeneration.incrementAndGet()
+            interactiveAuth = allowInteractiveAuth
             startJob = scope.launch {
             try {
-                connectionGeneration.incrementAndGet()
                 // Дожидаемся завершения фонового teardown от предыдущего stop()
                 // (см. stop(): он больше не блокирует вызывающий поток через
                 // runBlocking, а запускает teardown в stopJob асинхронно) —
                 // иначе новый старт может поднять WireGuard/Raw поверх ещё не
                 // до конца погашенного предыдущего интерфейса.
                 stopJob?.join()
+                connectionGeneration.requireCurrent(generation)
                 isDetailedLogsEnabled = runCatching {
                     SettingsStore(appContext).detailedLogs.first()
                 }.getOrDefault(false)
@@ -390,12 +393,12 @@ object TunnelManager {
 
                 if (hashList.isEmpty()) {
                     updateLog("hash_error", "Ошибка: Хеш не указан", 99, true)
-                    abortStart(isSwitching, "Хеш не указан")
+                    abortStart(isSwitching, "Хеш не указан", generation)
                     return@launch
                 }
                 if (params.connectionPassword.isBlank()) {
                     updateLog("password_error", "Ошибка: пароль подключения не указан", 99, true)
-                    abortStart(isSwitching, "Пароль не указан")
+                    abortStart(isSwitching, "Пароль не указан", generation)
                     return@launch
                 }
                 if (
@@ -405,7 +408,7 @@ object TunnelManager {
                         params.socksUsername.toByteArray().size > 255 || params.socksPassword.toByteArray().size > 255)
                 ) {
                     updateLog("socks_auth_error", "Ошибка: заполните корректные логин и пароль SOCKS5", 99, true)
-                    abortStart(isSwitching, "Не заполнены данные авторизации SOCKS5")
+                    abortStart(isSwitching, "Не заполнены данные авторизации SOCKS5", generation)
                     return@launch
                 }
 
@@ -428,12 +431,13 @@ object TunnelManager {
                 
                 if (!binaryFile.exists()) {
                     updateLog("binary_error", "Ошибка: Бинарный файл не найден", 99, true)
-                    abortStart(isSwitching, "Бинарный файл не найден")
+                    abortStart(isSwitching, "Бинарный файл не найден", generation)
                     return@launch
                 }
 
                 withContext(Dispatchers.IO) {
                     ensureTransportStopped(params.port)
+                    connectionGeneration.requireCurrent(generation)
                     VkCaptchaProfile.writeForGo(appContext)
                 }
 
@@ -533,8 +537,8 @@ object TunnelManager {
                         stats.value = "VK: вход в звонок…"
                         updateLog("vk_auth_start", "[VK Auth] Вход в звонок…", 5, false)
                         setConnectionPipelineCurrent(ConnectionStep.VK)
-                        val credsByHash = withControlPlaneNetwork(appContext) {
-                            VkAuthWebViewManager.authenticateAll(appContext, hashList)
+                        val credsByHash = withControlPlaneNetwork(appContext, generation) {
+                            VkAuthWebViewManager.authenticateAll(appContext, hashList, allowInteractiveAuth)
                         }
                         val credsFile = VkAuthWebViewManager.writeCredsFile(appContext, credsByHash)
                         cmd.add("-vk-creds-file")
@@ -548,13 +552,13 @@ object TunnelManager {
                         val msg = e.message ?: e::class.java.simpleName
                         updateLog("vk_auth_fail", "Ошибка авторизации VK: $msg", 99, true)
                         failConnectionPipeline(ConnectionStep.VK)
-                        abortStart(isSwitching, msg)
+                        abortStart(isSwitching, msg, generation)
                         return@launch
                     }
                 }
 
                 if (!isActive) {
-                    abortStart(isSwitching, "Подключение прервано")
+                    abortStart(isSwitching, "Подключение прервано", generation)
                     return@launch
                 }
 
@@ -567,7 +571,11 @@ object TunnelManager {
                 env["LD_LIBRARY_PATH"] = context.applicationInfo.nativeLibraryDir
                 env["WDTT_PROTECT_SOCKET"] = warmTransportProtector(context)
 
-                process = pb.start()
+                connectionGeneration.requireCurrent(generation)
+                val startedProcess = synchronized(startGate) {
+                    connectionGeneration.requireCurrent(generation)
+                    pb.start().also { process = it }
+                }
                 processStartedAtMs = System.currentTimeMillis()
                 wrapAuthTimeoutCount = 0
                 lastActiveAtMs = 0L
@@ -578,31 +586,38 @@ object TunnelManager {
                 isConnecting.value = false
                 markRunning(true)
                 stats.value = "Ожидание данных..."
-                startLogReader()
+                startLogReader(startedProcess, generation)
                 startWatchdog(appContext, params)
 
             } catch (e: kotlinx.coroutines.CancellationException) {
-                if (!isSwitching) {
+                if (connectionGeneration.get() == generation && !isSwitching) {
                     updateLog("start_cancelled", "Подключение отменено", 50, false)
                     finishConnectingFailed()
                 }
                 throw e
             } catch (e: Exception) {
+                if (connectionGeneration.get() != generation) return@launch
                 if (isSwitching) {
-                    handleSwitchingStartFailed("Критическая ошибка: ${e.message}")
+                    handleSwitchingStartFailed("Критическая ошибка: ${e.message}", generation)
                 } else {
                     updateLog("critical_start_error", "Критическая ошибка запуска: ${e.message}", 99, true)
                     e.printStackTrace()
                     finishConnectingFailed()
                 }
+            } finally {
+                if (connectionGeneration.get() == generation && !running.value) {
+                    withContext(kotlinx.coroutines.NonCancellable) { releaseWarmedService(generation) }
+                }
             }
         }
+        return generation
         }
     }
 
-    private fun abortStart(isSwitching: Boolean, message: String) {
+    private fun abortStart(isSwitching: Boolean, message: String, generation: Long) {
+        if (connectionGeneration.get() != generation) return
         if (isSwitching) {
-            handleSwitchingStartFailed(message)
+            handleSwitchingStartFailed(message, generation)
         } else {
             finishConnectingFailed()
         }
@@ -642,19 +657,18 @@ object TunnelManager {
         RawTunEngine.onVpnRevoked()
     }
 
-    private fun handleReconnectFailed(reason: String) {
-        transportRestartInProgress = false
-        isReconnecting.value = false
-        updateLog("reconnect_fail", "❌ Переподключение не удалось: $reason", 99, true)
-        scope.launch(Dispatchers.Main) {
-            wgHelper?.stopTunnel()
+    private fun handleReconnectFailed(reason: String, generation: Long) {
+        synchronized(startGate) {
+            if (connectionGeneration.get() != generation) return
+            updateLog("reconnect_fail", "Reconnect failed: $reason", 99, true)
             stop(force = true)
         }
     }
 
-    private fun handleSwitchingStartFailed(reason: String) {
+    private fun handleSwitchingStartFailed(reason: String, generation: Long) {
+        if (connectionGeneration.get() != generation) return
         if (!preserveVpnDuringReconnect) {
-            handleReconnectFailed(reason)
+            handleReconnectFailed(reason, generation)
             return
         }
         transportRestartInProgress = false
@@ -665,9 +679,11 @@ object TunnelManager {
     }
 
     @SuppressLint("StaticFieldLeak")
-    private fun startLogReader() {
+    private fun startLogReader(observedProcess: Process, generation: Long) {
+        fun current() = connectionGeneration.get() == generation && process === observedProcess
+        readerJob?.cancel()
         readerJob = scope.launch {
-            val observedProcess = process ?: return@launch
+            if (!current()) return@launch
             val reader = observedProcess.inputStream.bufferedReader()
             var collectingConfig = false
             val configBuilder = StringBuilder()
@@ -678,6 +694,7 @@ object TunnelManager {
                 var lastResetTime = System.currentTimeMillis()
 
                 reader.forEachLine { line ->
+                    if (!current()) return@forEachLine
                     // Периодический сброс счетчиков ошибок (раз в 60 сек)
                     val now = System.currentTimeMillis()
                     if (now - lastResetTime > 60000) {
@@ -707,7 +724,7 @@ object TunnelManager {
                             lineTrim.contains("другому устройству") -> "Пароль привязан к другому устройству"
                             else -> "Ошибка авторизации"
                         }
-                        handleCriticalError("\uD83D\uDD12 $reason. Воркеры остановлены.")
+                        handleCriticalError("\uD83D\uDD12 $reason. Воркеры остановлены.", generation)
                         return@forEachLine
                     }
 
@@ -753,19 +770,21 @@ object TunnelManager {
                                 val requestMode = parts[0]
                                 val redirectUri = parts[1]
                                 val sessionToken = parts[2]
-                                scope.launch {
-                                    handleCaptchaSolve(requestMode, redirectUri, sessionToken)
+                                launch {
+                                    if (!current()) return@launch
+                                    handleCaptchaSolve(requestMode, redirectUri, sessionToken, observedProcess, generation)
                                 }
                             }
                             2 -> {
                                 val redirectUri = parts[0]
                                 val sessionToken = parts[1]
-                                scope.launch {
-                                    handleCaptchaSolve("selected", redirectUri, sessionToken)
+                                launch {
+                                    if (!current()) return@launch
+                                    handleCaptchaSolve("selected", redirectUri, sessionToken, observedProcess, generation)
                                 }
                             }
                             else -> {
-                                writeCaptchaResult("error:invalid CAPTCHA_SOLVE format")
+                                writeCaptchaResult("error:invalid CAPTCHA_SOLVE format", observedProcess, generation)
                             }
                         }
                         return@forEachLine
@@ -775,8 +794,9 @@ object TunnelManager {
                     if (lineTrim.startsWith("VK_AUTH_REQUIRED|")) {
                         val hash = lineTrim.substringAfter("VK_AUTH_REQUIRED|").trim()
                         if (hash.isNotEmpty()) {
-                            scope.launch {
-                                handleVkAuthRequired(hash)
+                            launch {
+                                    if (!current()) return@launch
+                                handleVkAuthRequired(hash, observedProcess, generation)
                             }
                         }
                         return@forEachLine
@@ -788,14 +808,14 @@ object TunnelManager {
                             lineTrim.contains("Flood control", true) -> {
                                 floodCount++
                                 if (floodCount >= 5) {
-                                    handleCriticalError("Flood Control (ВК ограничил ваш IP). Попробуйте позже.")
+                                    handleCriticalError("Flood Control (ВК ограничил ваш IP). Попробуйте позже.", generation)
                                     return@forEachLine
                                 }
                             }
                             lineTrim.contains("ip mismatch", true) -> {
                                 mismatchCount++
                                 if (mismatchCount >= 5) {
-                                    handleCriticalError("IP Mismatch (IP утерян). Попробуйте переподключиться.")
+                                    handleCriticalError("IP Mismatch (IP утерян). Попробуйте переподключиться.", generation)
                                     return@forEachLine
                                 }
                             }
@@ -803,7 +823,7 @@ object TunnelManager {
                                 // Огромный лимит, потому что каждый воркер кидает эту ошибку при смене сети
                                 refusedCount++
                                 if (refusedCount >= 400) {
-                                    handleCriticalError("Критическое отсутствие сети (400+ таймаутов). Отключение.")
+                                    handleCriticalError("Критическое отсутствие сети (400+ таймаутов). Отключение.", generation)
                                     return@forEachLine
                                 }
                             }
@@ -811,7 +831,7 @@ object TunnelManager {
                                 currentHashErrorCount++
                                 // Нужно больше попыток, так как 1 воркер может спамить
                                 if (currentHashErrorCount >= 10) {
-                                    handleHashError()
+                                    handleHashError(generation)
                                     return@forEachLine
                                 }
                             }
@@ -847,7 +867,8 @@ object TunnelManager {
                                 val diff = currentTraffic - lastSavedTrafficMb
                                 if (diff >= 1.0) { // Каждые 1 МБ трафика
                                     val toSave = diff
-                                    scope.launch {
+                                    launch {
+                                    if (!current()) return@launch
                                         try {
                                             val ctx = lastContext?.get() ?: return@launch
                                             ProfilesStore(ctx).incrementProfileTraffic(profId, toSave)
@@ -1073,7 +1094,8 @@ object TunnelManager {
                                 failConnectionPipeline(ConnectionStep.RAW)
                                 updateLog("rawtun_conf_error", "[RAW] Некорректный конфиг от сервера или нет контекста", 99, true)
                             } else {
-                                scope.launch(Dispatchers.Main) {
+                                launch(Dispatchers.Main) {
+                                    if (!current()) return@launch
                                     try {
                                         RawTunEngine.start(rawCtx, ip, dnsCsv, mtu, rawTunSockName)
                                         markConnectionPipelineCompleted(ConnectionStep.RAW)
@@ -1124,17 +1146,19 @@ object TunnelManager {
                         if (line.contains("╚")) {
                             collectingConfig = false
                             val configStr = configBuilder.toString().trim()
-                            config.value = configStr
+                            synchronized(startGate) {
+                                if (current()) config.value = configStr
+                            }
 
                             if (currentParams?.isSocksMode == true) {
                                 // Userspace WG + SOCKS поднимает Go; Android VPN не трогаем.
                                 updateLog("socks_wg_conf", "[SOCKS] Конфиг получен, ждём локальный прокси…", 1, false)
                             } else {
-                                scope.launch(Dispatchers.Main) {
+                                launch(Dispatchers.Main) {
+                                    if (!current()) return@launch
                                     try {
-                                        val generation = connectionGeneration.get()
                                         while (controlPlaneBootstrapInProgress) delay(100)
-                                        if (connectionGeneration.get() != generation || currentParams == null) return@launch
+                                        if (!current()) return@launch
                                         val keepExisting = keepWireGuardOnNextConfig &&
                                             preservedWireGuardConfig == configStr &&
                                             wgHelper?.watchdogState() == WireGuardHelper.WatchdogState.UP
@@ -1145,9 +1169,13 @@ object TunnelManager {
                                         } else {
                                             updateLog("network_wg_kept", "[VPN] WireGuard-интерфейс сохранён при перезапуске транспорта", 1, false)
                                         }
+                                        if (!current()) return@launch
+                                        configuredGeneration = generation
+                                        interactiveAuth = false
                                         markConnectionPipelineCompleted(ConnectionStep.VPN)
                                         finishConnectionPipeline()
                                     } catch (e: Exception) {
+                                        if (!current()) return@launch
                                         failConnectionPipeline(ConnectionStep.VPN)
                                         val msg = "Ошибка запуска VPN: ${e.readableMessage()}"
                                         updateLog("vpn_start_error", msg, 99, true)
@@ -1184,22 +1212,22 @@ object TunnelManager {
                     }
                 }
             } catch (e: Exception) {
-                if (!transportRestartInProgress) {
+                if (current() && !transportRestartInProgress) {
                     updateLog("sys_error", "Процесс остановлен: ${e.message}", -1, true)
                 }
             } finally {
                 // Если процесс умер сам, ловим код выхода
                 try {
                     val exitCode = observedProcess.exitValue()
-                    if (exitCode != 0 && !transportRestartInProgress) {
+                    if (current() && exitCode != 0 && !transportRestartInProgress) {
                         updateLog("sys_exit", "Процесс крашнулся с кодом $exitCode", 99, true)
                     }
                 } catch (_: IllegalThreadStateException) {
-                    if (!transportRestartInProgress) {
+                    if (current() && !transportRestartInProgress) {
                         observedProcess.destroy()
                     }
                 }
-                if (process === observedProcess) {
+                if (current()) {
                     process = null
                     if (!transportRestartInProgress) {
                         markRunning(false)
@@ -1209,12 +1237,17 @@ object TunnelManager {
         }
     }
 
-    private fun handleCriticalError(message: String) {
+    private fun handleCriticalError(message: String, generation: Long = connectionGeneration.get()) {
+        synchronized(startGate) {
+        if (connectionGeneration.get() != generation) return
         updateLog("circuit_breaker", "[СТОП] $message", -1, true)
         stop()
+        }
     }
 
-    private fun handleHashError() {
+    private fun handleHashError(generation: Long) {
+        synchronized(startGate) {
+        if (connectionGeneration.get() != generation) return
         val params = currentParams ?: return
         val context = lastContext?.get() ?: return
 
@@ -1225,22 +1258,24 @@ object TunnelManager {
             updateLog("hash_switch", "Основной хеш мертв. Переключение на запасной...", 50, true)
             activeHashIndex = 1
             stopOnlyProcess()
-            start(context, params, isSwitching = true)
+            start(context, params, isSwitching = true, expectedGeneration = generation, allowInteractiveAuth = false)
         } else {
             val msg = if (activeHashIndex == 1) "Запасной хеш тоже мертв. Отключение." else "Хеш умер, запасного нет. Отключение."
-            handleCriticalError(msg)
+            handleCriticalError(msg, generation)
         }
+    }
     }
 
     // ==================== WATCHDOG ====================
     // Проверяет, жив ли Go-процесс. Если умер — перезапускает.
     // Если процесс жив, но 0 воркеров уже 30 сек — тоже перезапуск (зомби).
     private fun startWatchdog(context: Context, params: TunnelParams) {
+        val generation = connectionGeneration.get()
         watchdogJob?.cancel()
         watchdogJob = scope.launch {
             var zeroWorkersSince = 0L
             delay(10_000) // Даём 10 сек на старт
-            while (isActive && running.value) {
+            while (isActive && running.value && connectionGeneration.get() == generation) {
                 if (controlPlaneBootstrapInProgress) { zeroWorkersSince = 0L; delay(1000); continue }
                 val proc = process
                 if (proc == null || !proc.isAlive) {
@@ -1250,7 +1285,7 @@ object TunnelManager {
                     activeWorkers.value = 0
                     forceRegenerateUA = true
                     delay(backoffMs)
-                    if (running.value) {
+                    if (running.value && connectionGeneration.get() == generation) {
                         restartAttempts = (restartAttempts + 1).coerceAtMost(6)
                         reconnectAll("процесс упал")
                     }
@@ -1269,7 +1304,7 @@ object TunnelManager {
                         lastActiveAtMs == 0L &&
                         !ManlCaptchaWebViewManager.isCaptchaPending
                     ) {
-                        handleCriticalError("\uD83D\uDD12 Неверный пароль подключения или несовместимый WRAP. Воркеры остановлены.")
+                        handleCriticalError("\uD83D\uDD12 Неверный пароль подключения или несовместимый WRAP. Воркеры остановлены.", generation)
                         return@launch
                     } else if (System.currentTimeMillis() - zeroWorkersSince > 90_000 && !ManlCaptchaWebViewManager.isCaptchaPending) {
                         updateLog("watchdog", "⚠ Зомби-процесс (0 воркеров 90с). Перезапуск...", 50, true)
@@ -1336,73 +1371,63 @@ object TunnelManager {
     }
 
     fun reconnectAll(reason: String, force: Boolean = false, preserveVpn: Boolean = false) {
-        if (controlPlaneBootstrapInProgress) return
-        val params = currentParams ?: return
-        val context = lastContext?.get() ?: return
-
-        scope.launch {
-            reconnectMutex.withLock {
-                if (controlPlaneBootstrapInProgress) return@withLock
-                val now = System.currentTimeMillis()
-                if (!force && now - lastReconnectAtMs < MIN_RECONNECT_INTERVAL_MS) {
-                    updateLog("reconnect_skip", "Переподключение уже выполняется…", 50, false)
-                    return@launch
-                }
-                lastReconnectAtMs = now
-
-                isReconnecting.value = true
-                transportRestartInProgress = true
-                preserveVpnDuringReconnect = preserveVpn
-                updateLog("reconnect", "🔄 Переподключение ($reason)...", 50, false)
-                try {
-                    val previousWireGuardConfig = config.value?.trim()
-                    keepWireGuardOnNextConfig = false
-                    preservedWireGuardConfig = null
-                    withContext(Dispatchers.IO) {
+        synchronized(startGate) {
+            if (controlPlaneBootstrapInProgress || reconnectJob?.isActive == true) return
+            val params = currentParams ?: return
+            val context = lastContext?.get() ?: return
+            val expected = connectionGeneration.get()
+            val job = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+                var generation = expected
+                reconnectMutex.withLock {
+                    connectionGeneration.requireCurrent(generation)
+                    if (controlPlaneBootstrapInProgress) return@withLock
+                    val now = System.currentTimeMillis()
+                    if (!force && now - lastReconnectAtMs < MIN_RECONNECT_INTERVAL_MS) return@withLock
+                    lastReconnectAtMs = now
+                    isReconnecting.value = true
+                    transportRestartInProgress = true
+                    preserveVpnDuringReconnect = preserveVpn
+                    updateLog("reconnect", "Reconnecting ($reason)", 50, false)
+                    try {
+                        val previousConfig = config.value?.trim()
                         ensureTransportStopped(params.port)
-                        if (params.isRawTunMode) {
-                            if (preserveVpn) {
-                                RawTunEngine.prepareForTransportRestart()
-                            } else {
-                                RawTunEngine.prepareForReconnect()
-                            }
-                        } else if (!params.isSocksMode) {
-                            if (preserveVpn) {
-                                keepWireGuardOnNextConfig = true
-                                preservedWireGuardConfig = previousWireGuardConfig
-                            } else {
-                                keepWireGuardOnNextConfig = false
-                                preservedWireGuardConfig = null
-                                wgHelper?.stopTunnel()
-                            }
+                        connectionGeneration.requireCurrent(generation)
+                        keepWireGuardOnNextConfig = preserveVpn
+                        preservedWireGuardConfig = if (preserveVpn) previousConfig else null
+                        if (!preserveVpn) wgHelper?.stopTunnel()
+                        connectionGeneration.requireCurrent(generation)
+                        activeWorkers.value = 0
+                        processStartedAtMs = 0L
+                        lastActiveAtMs = 0L
+                        lastStatsReceivedAtMs = 0L
+                        resetTransportTrafficHealth()
+                        markRunning(false)
+                        config.value = null
+                        generation = start(context, params, isSwitching = true, expectedGeneration = generation,
+                            allowInteractiveAuth = false) ?: return@withLock
+                        connectionGeneration.requireCurrent(generation)
+                        startJob?.join()
+                        connectionGeneration.requireCurrent(generation)
+                        if (currentParams == null || process == null) return@withLock
+                        awaitWireGuardReady()
+                        connectionGeneration.requireCurrent(generation)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        if (connectionGeneration.get() == generation) {
+                            handleSwitchingStartFailed(e.message ?: e::class.java.simpleName, generation)
+                        }
+                    } finally {
+                        if (connectionGeneration.get() == generation) {
+                            preserveVpnDuringReconnect = false
+                            transportRestartInProgress = false
+                            isReconnecting.value = false
                         }
                     }
-                    activeWorkers.value = 0
-                    processStartedAtMs = 0L
-                    lastActiveAtMs = 0L
-                    lastStatsReceivedAtMs = 0L
-                    resetTransportTrafficHealth()
-                    markRunning(false)
-                    config.value = null
-                    start(context, params, isSwitching = true)
-                    startJob?.join()
-                    if (currentParams == null || process == null) return@withLock
-                    if (params.isRawTunMode) {
-                        awaitRawTunReady()
-                    } else if (!params.isSocksMode) {
-                        awaitWireGuardReady()
-                    }
-                } catch (e: CancellationException) {
-                    transportRestartInProgress = false
-                    throw e
-                } catch (e: Exception) {
-                    handleSwitchingStartFailed(e.message ?: e::class.java.simpleName)
-                } finally {
-                    preserveVpnDuringReconnect = false
-                    transportRestartInProgress = false
-                    isReconnecting.value = false
                 }
             }
+            reconnectJob = job
+            job.start()
         }
     }
 
@@ -1460,9 +1485,8 @@ object TunnelManager {
         stopGoProcessGracefully()
     }
 
-    private fun stopGoProcessGracefully() {
-        val proc = process
-        process = null
+    private fun stopGoProcessGracefully(proc: Process? = process) {
+        if (process === proc) process = null
         if (proc == null) return
         try {
             proc.outputStream.write("STOP\n".toByteArray(Charsets.UTF_8))
@@ -1557,6 +1581,7 @@ object TunnelManager {
     }
 
     fun stop(force: Boolean = false) {
+        synchronized(startGate) {
         if (!force && isConnecting.value && !running.value) {
             val age = System.currentTimeMillis() - connectingStartedAtMs
             if (age in 0 until CONNECT_STOP_GRACE_MS) {
@@ -1564,10 +1589,17 @@ object TunnelManager {
                 return
             }
         }
-        connectionGeneration.incrementAndGet()
-        saveRemainingTraffic()
-        startJob?.cancel()
+        val stoppedGeneration = connectionGeneration.incrementAndGet()
+        val previousStop = stopJob
+        val reconnectSnapshot = reconnectJob
+        reconnectJob = null
+        reconnectSnapshot?.cancel()
+        val startSnapshot = startJob
+        startSnapshot?.cancel()
         startJob = null
+        val processSnapshot = process
+        process = null
+        saveRemainingTraffic()
         try {
             VkAuthWebViewManager.notifyCancelled()
         } catch (_: Exception) {
@@ -1596,7 +1628,10 @@ object TunnelManager {
         val wgHelperSnapshot = wgHelper
         currentParams = null
         stopJob = scope.launch(Dispatchers.IO) {
-            runCatching { stopGoProcessGracefully() }
+            previousStop?.join()
+            reconnectSnapshot?.join()
+            startSnapshot?.join()
+            runCatching { stopGoProcessGracefully(processSnapshot) }
             if (paramsSnapshot?.isRawTunMode == true) {
                 val ctx = lastContext?.get()
                 if (ctx != null) {
@@ -1604,6 +1639,8 @@ object TunnelManager {
                 }
             }
             runCatching { wgHelperSnapshot?.stopTunnel() }
+            releaseWarmedService(stoppedGeneration)
+        }
         }
     }
 
@@ -1618,11 +1655,12 @@ object TunnelManager {
 
     // ==================== CAPTCHA SOLVER (WebView Mode) ====================
 
-    private suspend fun <T> withControlPlaneNetwork(ctx: Context, action: suspend () -> T): T {
+    private suspend fun <T> withControlPlaneNetwork(ctx: Context, expectedGeneration: Long? = null, action: suspend () -> T): T {
         var savedConfig: String? = null
-        val generation = connectionGeneration.get()
+        val generation = expectedGeneration ?: connectionGeneration.get()
         val helper = wgHelper
-        return controlPlane.run(
+        return kotlinx.coroutines.withTimeout(if (interactiveAuth) 120_000L else 20_000L) {
+        controlPlane.run(
             release = {
                 if (connectionGeneration.get() != generation || currentParams == null) {
                     throw CancellationException("Stale control bootstrap")
@@ -1653,9 +1691,32 @@ object TunnelManager {
                 result
             },
         )
+        }
+    }
+
+    private suspend fun releaseWarmedService(generation: Long) {
+        if (connectionGeneration.get() != generation) return
+        val ctx = lastContext?.get() ?: return
+        if (wgHelper?.watchdogState() == WireGuardHelper.WatchdogState.UP) return
+        withContext(Dispatchers.Main) {
+            synchronized(startGate) {
+                if (connectionGeneration.get() == generation) {
+                    retiringWarmOwner = TransportSocketProtector.ownerIdentity()
+                    ctx.stopService(android.content.Intent(ctx, AlwaysOnVpnService::class.java))
+                }
+            }
+        }
+        awaitRetiringWarmOwner()
+    }
+
+    private suspend fun awaitRetiringWarmOwner() {
+        val owner = retiringWarmOwner ?: return
+        TransportSocketProtector.awaitOwnerReleased(owner)
+        if (retiringWarmOwner === owner) retiringWarmOwner = null
     }
 
     private suspend fun warmTransportProtector(ctx: Context): String {
+        awaitRetiringWarmOwner()
         withContext(Dispatchers.Main) {
             ctx.startService(android.content.Intent(ctx, AlwaysOnVpnService::class.java))
         }
@@ -1673,18 +1734,22 @@ object TunnelManager {
      * selected: старое поведение из UI, когда пользователь сам выбрал режим.
      * Результат ВСЕГДА отправляется обратно в Go через writeCaptchaResult.
      */
-    private suspend fun handleCaptchaSolve(requestMode: String, redirectUri: String, sessionToken: String) {
+    private suspend fun handleCaptchaSolve(requestMode: String, redirectUri: String, sessionToken: String, observedProcess: Process, generation: Long) {
+        connectionGeneration.requireCurrent(generation)
         val ctx = lastContext?.get() ?: run {
-            writeCaptchaResult("error:context is null")
+            writeCaptchaResult("error:context is null", observedProcess, generation)
             return
         }
         val mode = requestMode.lowercase()
 
         try {
+            if (!interactiveAuth && (mode == "manual" || (mode == "selected" && currentCaptchaSolveMethod != "auto"))) {
+                error("CAPTCHA needs an explicit connection attempt")
+            }
             if (mode == "manual") {
                 VkWebViewCookies.clearCaptchaCookies()
             }
-            val token = withControlPlaneNetwork(ctx) {
+            val token = withControlPlaneNetwork(ctx, generation) {
                 when (mode) {
                     "auto" -> solveSingleAutoWebViewCaptcha(redirectUri, sessionToken)
                     "manual" -> {
@@ -1702,23 +1767,23 @@ object TunnelManager {
                 }
             }
             updateLog("captcha_wv_step_4", "[КАПЧА WBV] Капча решена ✓", 5, false)
-            writeCaptchaResult(token)
+            writeCaptchaResult(token, observedProcess, generation)
         } catch (e: IllegalStateException) {
             val errorMsg = e.message ?: "WV state error"
             updateLog("captcha_wv_err", "[КАПЧА WBV] $errorMsg", 5, true)
-            writeCaptchaResult("error:$errorMsg")
+            writeCaptchaResult("error:$errorMsg", observedProcess, generation)
         } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
             updateLog("captcha_wv_err", "[КАПЧА WBV] Таймаут WebView", 5, true)
-            writeCaptchaResult("error:timeout")
+            writeCaptchaResult("error:timeout", observedProcess, generation)
         } catch (e: kotlin.coroutines.cancellation.CancellationException) {
             updateLog("captcha_wv_err", "[КАПЧА WBV] Отменено", 5, true)
-            writeCaptchaResult("error:cancelled")
+            writeCaptchaResult("error:cancelled", observedProcess, generation)
         } catch (e: Exception) {
             val errorMsg = e.message ?: "${e::class.simpleName}"
             if (errorMsg != "tunnel stopped") {
                 updateLog("captcha_wv_err", "[КАПЧА WBV] Ошибка — $errorMsg", 5, true)
             }
-            writeCaptchaResult("error:$errorMsg")
+            writeCaptchaResult("error:$errorMsg", observedProcess, generation)
         }
 
         // WebView уничтожен в finally блоке соответствующего менеджера.
@@ -1750,25 +1815,27 @@ object TunnelManager {
                 updateLog("captcha_wv_timeout_$attempt", "[КАПЧА WBV] Авто таймаут 10с ($attempt/2)", 5, attempt == 2)
                 if (attempt == 2) {
                     updateLog("captcha_wv_fallback", "[КАПЧА WBV] 2 таймаута авто, открыт ручной WebView", 5, false)
+                    check(interactiveAuth) { "CAPTCHA requires user action" }
                     return ManlCaptchaWebViewManager.solveCaptchaAsync(ctx, redirectUri, sessionToken)
                 }
             } catch (e: IllegalStateException) {
                 if (e.message == CaptchaWebViewManager.ERROR_SLIDER_DETECTED) {
                     updateLog("captcha_wv_fallback", "[КАПЧА WBV] Обнаружен слайдер, открыт ручной WebView", 5, false)
+                    check(interactiveAuth) { "CAPTCHA requires user action" }
                     return ManlCaptchaWebViewManager.solveCaptchaAsync(ctx, redirectUri, sessionToken)
                 }
                 throw e
             }
         }
+        check(interactiveAuth) { "CAPTCHA requires user action" }
         return ManlCaptchaWebViewManager.solveCaptchaAsync(ctx, redirectUri, sessionToken)
     }
 
     /**
      * Записывает результат решения капчи в stdin Go-процесса.
      */
-    private fun writeCaptchaResult(result: String) {
-        val proc = process
-        if (proc == null || !proc.isAlive) return
+    private fun writeCaptchaResult(result: String, proc: Process? = process, generation: Long = connectionGeneration.get()) {
+        if (connectionGeneration.get() != generation || proc !== process || proc == null || !proc.isAlive) return
         try {
             val line = "CAPTCHA_RESULT|$result\n"
             proc.outputStream.write(line.toByteArray(Charsets.UTF_8))
@@ -1778,31 +1845,31 @@ object TunnelManager {
         }
     }
 
-    private suspend fun handleVkAuthRequired(hash: String) {
+    private suspend fun handleVkAuthRequired(hash: String, observedProcess: Process, generation: Long) {
+        connectionGeneration.requireCurrent(generation)
         val ctx = lastContext?.get()
         if (ctx == null) {
-            writeTurnCredsError()
+            writeTurnCredsError(observedProcess, generation)
             return
         }
         updateLog("vk_auth_refresh", "[VK Auth] Обновление TURN для ${hash.take(8)}…", 5, false)
         try {
-            val result = withControlPlaneNetwork(ctx) { VkAuthWebViewManager.authenticate(ctx, hash) }
+            val result = withControlPlaneNetwork(ctx, generation) { VkAuthWebViewManager.authenticate(ctx, hash, false) }
             val creds = result.getOrElse {
-                writeTurnCredsError()
+                writeTurnCredsError(observedProcess, generation)
                 updateLog("vk_auth_refresh_fail", "[VK Auth] Ошибка: ${it.message}", 99, true)
                 return
             }
-            writeTurnCreds(hash, creds)
+            writeTurnCreds(hash, creds, observedProcess, generation)
             updateLog("vk_auth_refresh_ok", "[VK Auth] TURN обновлены", 5, false)
         } catch (e: Exception) {
-            writeTurnCredsError()
+            writeTurnCredsError(observedProcess, generation)
             updateLog("vk_auth_refresh_fail", "VK auth: ${e.message}", 99, true)
         }
     }
 
-    private fun writeTurnCreds(hash: String, creds: VkTurnCreds) {
-        val proc = process
-        if (proc == null || !proc.isAlive) return
+    private fun writeTurnCreds(hash: String, creds: VkTurnCreds, proc: Process, generation: Long) {
+        if (connectionGeneration.get() != generation || proc !== process || !proc.isAlive) return
         try {
             val line = VkAuthWebViewManager.encodeTurnCredsPayload(hash, creds)
             proc.outputStream.write(line.toByteArray(Charsets.UTF_8))
@@ -1812,9 +1879,8 @@ object TunnelManager {
         }
     }
 
-    private fun writeTurnCredsError() {
-        val proc = process
-        if (proc == null || !proc.isAlive) return
+    private fun writeTurnCredsError(proc: Process, generation: Long) {
+        if (connectionGeneration.get() != generation || proc !== process || !proc.isAlive) return
         try {
             proc.outputStream.write("TURN_CREDS|error:cancelled\n".toByteArray(Charsets.UTF_8))
             proc.outputStream.flush()
@@ -1946,8 +2012,10 @@ object TunnelManager {
         if (step == ConnectionStep.VK && isAccountVkAuthActive()) return
 
         val timeoutMs = pipelineTimeoutFor(step)
+        val generation = connectionGeneration.get()
         pipelineStepTimeoutJob = scope.launch {
             delay(timeoutMs)
+            if (connectionGeneration.get() != generation) return@launch
             val state = connectionPipeline.value
             if (!state.visible || state.failed != null || state.current != step) return@launch
             onPipelineStepTimeout(step, timeoutMs)
@@ -1971,22 +2039,7 @@ object TunnelManager {
             99,
             true
         )
-        startJob?.cancel()
-        startJob = null
-        if (running.value || process != null) {
-            stopRawTunIfNeeded()
-            scope.launch(Dispatchers.Main) {
-                wgHelper?.stopTunnel()
-            }
-            killProcess()
-            markRunning(false)
-            isConnecting.value = false
-            activeWorkers.value = 0
-            currentParams = null
-            runCatching { ManlCaptchaWebViewManager.cancelCaptcha() }
-        } else {
-            finishConnectingFailed()
-        }
+        stop(force = true)
     }
 
     private fun setConnectionPipelineCurrent(step: ConnectionStep) {

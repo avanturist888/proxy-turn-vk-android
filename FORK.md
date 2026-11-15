@@ -16,8 +16,10 @@ It installs alongside upstream; it cannot update an APK signed by another key.
    **Always-on VPN** and **Block connections without VPN**. Only Android/the user
    can grant this system policy; installing the app alone does not enable it.
 4. With these settings, apps wait during recovery instead of falling back to the
-   mobile/Wi-Fi connection. System always-on starts try saved servers in order,
-   use the first working path, and keep retrying the list after failures.
+   mobile/Wi-Fi connection. System always-on starts try saved servers in order.
+   A manual connection is also supervised: its exact parameters are tried first,
+   followed by saved profiles after the selected profile, wrapping to the start.
+   Enabling always-on on an already connected VPN retains this recovery loop.
 
 By default, all application IPv4, IPv6 and DNS traffic enters the VPN. Imported
 app/site exclusions are ignored until **Allow selected exclusions directly** is
@@ -56,9 +58,20 @@ cannot produce a false success. These checks detect a dead path
 even if local statistics keep arriving. Two failed checks trigger recovery;
 success clears the failure streak. Repeated failures are rate limited. Recovery
 does not require Android's Internet-validation probe to succeed, and continues
-with the screen off. Server selection allows up to 60 seconds per saved server;
-probes run every 10 seconds after connection. Wrong credentials or an unavailable
-VK login still need correction; the fork cannot manufacture valid credentials.
+with the screen off. Unattended attempts have a hard 60-second limit and control
+WebViews a 20-second limit. The first explicit connection allows up to 180 seconds
+overall and 120 seconds for interactive sign-in. Deadlines never extend while
+CAPTCHA or account login repeats. Established sessions also abandon stalled
+control/reconnect work within these unattended limits and try the next server.
+The list is retried after a 60-second cooldown; automatic attempts do not keep
+opening interactive sign-in or manual CAPTCHA. Wrong credentials need correction.
+
+Stop revokes the current session before cancelling work. The next attempt waits
+for its predecessor's teardown; buffered output and delayed callbacks retain the
+process/session identity that produced them. Warmed VPN services are released
+even when startup fails before an interface exists. Sticky restarts resume only
+a persisted connection request or Android's system always-on request; explicit
+Stop clears the persisted request.
 
 ## Integration and validation
 

@@ -22,8 +22,8 @@ android {
         applicationId = "net.qwdtt.client.fork"
         minSdk = 28
         targetSdk = 35
-        versionCode = 43
-        versionName = "1.4.4.1"
+        versionCode = 44
+        versionName = "1.4.4.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

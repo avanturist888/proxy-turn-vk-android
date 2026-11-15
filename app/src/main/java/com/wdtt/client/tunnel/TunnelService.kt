@@ -33,7 +33,7 @@ private const val RAW_WAKE_RESTART_THRESHOLD_MS = 60_000L
 
 class TunnelService : Service() {
     private var automaticJob: Job? = null
-    private var pathHealthJob: Job? = null
+    private val recoveryRequest = java.util.concurrent.atomic.AtomicLong()
     @Volatile private var automaticRequested = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -70,8 +70,8 @@ class TunnelService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent == null) {
-            startAutomatic()
-            return START_STICKY
+            if (RecoveryIntentStore.requested(this)) startAutomatic() else stopSelf()
+            return if (RecoveryIntentStore.requested(this)) START_STICKY else START_NOT_STICKY
         }
 
         when (intent.action) {
@@ -81,6 +81,8 @@ class TunnelService : Service() {
                 startPersistentForeground(notification)
 
                 val appContext = applicationContext
+                val commandRequest = if (intent.getBooleanExtra("automatic", false))
+                    intent.getLongExtra("recovery_request", -1L) else recoveryRequest.incrementAndGet()
                 TunnelManager.scope.launch {
                     try {
                         val store = SettingsStore(appContext)
@@ -157,17 +159,19 @@ class TunnelService : Service() {
                             detailedLogs = store.detailedLogs.first()
                         )
                         launch(Dispatchers.Main) {
-                            if (intent.getBooleanExtra("automatic", false) && !automaticRequested) return@launch
+                            if (commandRequest != recoveryRequest.get() ||
+                                (intent.getBooleanExtra("automatic", false) && !automaticRequested)) return@launch
                             startTunnel(
                                 params,
-                                forceStart = intent.action == "START_FORCED" || intent.action == "START_SAVED"
+                                forceStart = intent.action == "START_FORCED" || intent.action == "START_SAVED",
+                                automaticAttempt = intent.getBooleanExtra("automatic", false)
                             )
                         }
                     } catch (e: kotlinx.coroutines.CancellationException) {
                         throw e
                     } catch (e: Exception) {
                         if (!intent.getBooleanExtra("automatic", false)) {
-                            launch(Dispatchers.Main) { stopTunnel() }
+                            launch(Dispatchers.Main) { if (commandRequest == recoveryRequest.get()) stopTunnel() }
                         } else {
                             TunnelManager.addNetworkLog("Saved server could not start; trying the next server")
                         }
@@ -263,7 +267,15 @@ class TunnelService : Service() {
         }
     }
 
-    private fun startTunnel(params: TunnelParams, forceStart: Boolean = false) {
+    private fun startTunnel(params: TunnelParams, forceStart: Boolean = false, automaticAttempt: Boolean = false) {
+        if (!automaticAttempt) {
+            recoveryRequest.incrementAndGet()
+            automaticJob?.cancel()
+            automaticJob = null
+            automaticRequested = false
+            TunnelManager.stop(force = true)
+        }
+        RecoveryIntentStore.setRequested(this, true)
         // Учитываем и невалидированный Wi‑Fi: иначе через секунду VALIDATED
         // выглядит как «переход на Wi‑Fi» и стоп по опции убивает ручной старт.
         wasOnWifi = isUnderlyingWifiActive() || isUnderlyingWifiPresent()
@@ -275,92 +287,104 @@ class TunnelService : Service() {
         // Вызываем всегда — дёшево, а WebView создаётся на лету при каждом запросе капчи
         CaptchaWebViewManager.onTunnelStart(applicationContext)
 
-        TunnelManager.start(this, params, isSwitching = false, forceStart = forceStart)
+        TunnelManager.start(this, params, isSwitching = false, forceStart = forceStart,
+            allowInteractiveAuth = !automaticAttempt)
         startStatsUpdater()
-        startPathHealthChecks()
+        if (!automaticAttempt) startAutomatic(params)
     }
 
-    private fun startAutomatic() {
-        if (TunnelManager.controlPlaneBootstrapInProgress) return
-        startPersistentForeground(createNotification("Автоматическое подключение VPN…"))
-        if (automaticJob?.isActive == true) return
+    private fun startAutomatic(initialParams: TunnelParams? = null) {
+        startPersistentForeground(createNotification("Automatic VPN recovery"))
+        RecoveryIntentStore.setRequested(this, true)
+        if (automaticJob?.isActive == true) return // Also covers OS enabling always-on on an active VPN.
         automaticRequested = true
         automaticJob = TunnelManager.scope.launch {
             SettingsStore.awaitMigrations(applicationContext)
             val profiles = ProfilesStore(applicationContext)
+            val selected = SettingsStore(applicationContext).currentProfileId.first()
+            var firstAttempt = initialParams != null
             while (isActive && automaticRequested) {
                 val candidates = profiles.profiles.first().filter { it.peer.isNotBlank() }
-                // A saved single configuration remains usable before profiles are created.
-                val ids = candidates.map { it.id }.ifEmpty { listOf("") }
-                for (id in ids) {
+                val selectedMatches = candidates.any { it.id == selected && initialParams != null &&
+                    PeerAddress.host(it.peer) == PeerAddress.host(initialParams.peer) &&
+                    it.password == initialParams.connectionPassword }
+                val savedOrder = if (initialParams == null) candidates.map { it.id }
+                    else recoveryProfileOrder(candidates.map { it.id }, if (selectedMatches) selected else "")
+                val targets: List<String?> = if (initialParams != null) listOf(null) + savedOrder
+                    else savedOrder.ifEmpty { listOf(null) }
+                for (id in targets) {
                     if (!isActive || !automaticRequested) break
+                    val request = recoveryRequest.incrementAndGet()
+                    val explicitFirstAttempt = firstAttempt
                     try {
-                        TunnelManager.stop(force = true)
-                        if (id.isNotEmpty()) profiles.applyProfile(applicationContext, id)
-                        startService(Intent(applicationContext, TunnelService::class.java).apply {
-                            action = "START_SAVED"
-                            putExtra("automatic", true)
-                        })
-                        var deadline = android.os.SystemClock.elapsedRealtime() + 60_000L
-                        var connected = false
-                        while (isActive && automaticRequested && android.os.SystemClock.elapsedRealtime() < deadline) {
-                            delay(2000)
-                            if (TunnelManager.controlPlaneBootstrapInProgress) { deadline += 2000; continue }
-                            if (TunnelManager.running.value && TunnelManager.config.value != null && TunnelReachability.check(applicationContext)) {
-                                connected = true
-                                break
+                        if (!firstAttempt) {
+                            TunnelManager.stop(force = true)
+                            if (id == null && initialParams != null) {
+                                kotlinx.coroutines.withContext(Dispatchers.Main) {
+                                    startTunnel(initialParams, forceStart = true, automaticAttempt = true)
+                                }
+                            } else {
+                                if (id != null) profiles.applyProfile(applicationContext, id)
+                                startService(Intent(applicationContext, TunnelService::class.java).apply {
+                                    action = "START_SAVED"
+                                    putExtra("automatic", true)
+                                    putExtra("recovery_request", request)
+                                })
                             }
                         }
+                        firstAttempt = false
+                        val budget = RecoveryBudget(android.os.SystemClock.elapsedRealtime(),
+                            if (explicitFirstAttempt) 180_000L else 60_000L,
+                            if (explicitFirstAttempt) 120_000L else 20_000L)
+                        var connected = false
+                        while (isActive && automaticRequested) {
+                            delay(1000)
+                            if (budget.expired(android.os.SystemClock.elapsedRealtime(),
+                                    TunnelManager.controlPlaneBootstrapInProgress)) break
+                            if (!TunnelManager.controlPlaneBootstrapInProgress && TunnelManager.hasSessionVpn() &&
+                                TunnelReachability.check(applicationContext)) { connected = true; break }
+                        }
                         val policy = RecoveryPolicy()
+                        var busyBudget: RecoveryBudget? = null
                         while (isActive && automaticRequested && connected) {
-                            delay(10_000)
-                            if (TunnelManager.isConnecting.value || TunnelManager.isReconnecting.value ||
-                                TunnelManager.controlPlaneBootstrapInProgress) continue
-                            if (policy.record(TunnelManager.running.value && TunnelReachability.check(applicationContext), android.os.SystemClock.elapsedRealtime())) {
-                                connected = false // Try next saved server; loop never enters a terminal paused state.
+                            delay(5000)
+                            val now = android.os.SystemClock.elapsedRealtime()
+                            val busy = TunnelManager.isConnecting.value || TunnelManager.isReconnecting.value ||
+                                TunnelManager.controlPlaneBootstrapInProgress
+                            if (busy) {
+                                val limit = busyBudget ?: RecoveryBudget(now).also { busyBudget = it }
+                                if (limit.expired(now, TunnelManager.controlPlaneBootstrapInProgress)) break
+                            } else {
+                                busyBudget = null
+                                if (policy.record(TunnelReachability.check(applicationContext), now)) break
                             }
                         }
                     } catch (e: kotlinx.coroutines.CancellationException) {
                         throw e
                     } catch (_: Exception) {
                         TunnelManager.addNetworkLog("Saved server unavailable; trying the next server")
-                        delay(1000)
+                    } finally {
+                        if (recoveryRequest.get() == request) TunnelManager.stop(force = true)
                     }
                 }
-                if (automaticRequested) delay(10_000)
+                // Bad credentials/interactive challenges do not create repeated prompt loops.
+                if (automaticRequested) delay(60_000)
             }
         }
     }
 
-    private fun startPathHealthChecks() {
-        pathHealthJob?.cancel()
-        if (automaticRequested) return // The server-selection loop owns checks in this mode.
-        pathHealthJob = TunnelManager.scope.launch {
-            val policy = RecoveryPolicy()
-            delay(30_000)
-            while (isActive) {
-                if (TunnelManager.running.value && !isTunnelPaused && !TunnelManager.isReconnecting.value &&
-                    !TunnelManager.controlPlaneBootstrapInProgress &&
-                    policy.record(TunnelReachability.check(applicationContext), android.os.SystemClock.elapsedRealtime())) {
-                    TunnelManager.restartTransport("нет ответа через туннель", force = true)
-                }
-                delay(10_000)
-            }
-        }
-    }
-
-    private fun stopTunnel() {
+    private fun stopTunnel(explicit: Boolean = true) {
+        if (explicit) RecoveryIntentStore.setRequested(this, false)
+        recoveryRequest.incrementAndGet()
         automaticRequested = false
         automaticJob?.cancel()
         automaticJob = null
-        pathHealthJob?.cancel()
-        pathHealthJob = null
         updateJob?.cancel()
 
         // Уничтожаем текущий WebView (если капча решается) и чистим контекст
         CaptchaWebViewManager.onTunnelStop()
 
-        TunnelManager.stop()
+        TunnelManager.stop(force = true)
         releaseWakeLock()
         releaseWifiLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -861,7 +885,7 @@ class TunnelService : Service() {
         networkCallback?.let {
             connectivityManager?.unregisterNetworkCallback(it)
         }
-        stopTunnel()
+        stopTunnel(explicit = false)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

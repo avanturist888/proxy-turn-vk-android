@@ -346,7 +346,7 @@ object VkAuthWebViewManager {
      * Сначала тихий режим (только логи), видимый WebView — если тихий не сработал
      * или нет сессии VK.
      */
-    suspend fun authenticate(context: Context, hash: String): Result<VkTurnCreds> {
+    suspend fun authenticate(context: Context, hash: String, allowInteractive: Boolean = true): Result<VkTurnCreds> {
         val cleanHash = stripVkUrlStatic(hash.trim())
         if (cleanHash.length < 8) {
             return Result.failure(IllegalArgumentException("Некорректный VK-хеш"))
@@ -369,6 +369,7 @@ object VkAuthWebViewManager {
             logAuth("Нет сессии VK — нужен вход")
         }
 
+        if (!allowInteractive) return Result.failure(IllegalStateException("VK account needs explicit sign-in"))
         return runJoinCall(context, cleanHash)
     }
 
@@ -693,12 +694,12 @@ object VkAuthWebViewManager {
         }
     }
 
-    suspend fun authenticateAll(context: Context, hashes: List<String>): Map<String, VkTurnCreds> {
+    suspend fun authenticateAll(context: Context, hashes: List<String>, allowInteractive: Boolean = true): Map<String, VkTurnCreds> {
         val out = linkedMapOf<String, VkTurnCreds>()
         for (hash in hashes.distinct()) {
             val clean = stripVkUrlStatic(hash.trim())
             if (clean.length < 8) continue
-            val result = authenticate(context, clean)
+            val result = authenticate(context, clean, allowInteractive)
             if (result.isFailure) {
                 throw result.exceptionOrNull() ?: Exception("VK auth failed for $clean")
             }
