@@ -55,7 +55,7 @@ class TunnelWidgetProvider : AppWidgetProvider() {
     }
 
     companion object {
-        const val ACTION_TOGGLE = "net.qwdtt.client.ACTION_TOGGLE"
+        const val ACTION_TOGGLE = "net.qwdtt.client.fork.ACTION_TOGGLE"
 
         fun updateWidgetState(context: Context, running: Boolean, statsText: String?) {
             val appWidgetManager = AppWidgetManager.getInstance(context)

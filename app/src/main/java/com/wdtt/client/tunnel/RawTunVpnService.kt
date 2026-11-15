@@ -182,13 +182,6 @@ class RawTunVpnService : VpnService() {
     private fun applyAppFilters(builder: Builder) {
         if (FORCE_FULL_TUNNEL) {
             diag("FORCE_FULL_TUNNEL: игнорирую фильтр приложений — весь трафик через туннель")
-            val transport = setOf(packageName, "com.vkontakte.android", "com.vk.calls")
-            for (pkg in transport) {
-                if (isInstalled(pkg)) {
-                    val r = runCatching { builder.addDisallowedApplication(pkg) }
-                    if (r.isFailure) diag("addDisallowedApplication($pkg) FAILED: ${r.exceptionOrNull()}", isError = true)
-                }
-            }
             return
         }
         val store = SettingsStore(applicationContext)

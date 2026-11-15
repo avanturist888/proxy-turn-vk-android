@@ -843,13 +843,14 @@ fun SettingsTabContent(
                                 fontWeight = FontWeight.Medium
                             )
                             Text(
-                                "Автоматически отключать туннель при подключении к Wi-Fi (удобно для обхода БС только в мобильной сети)",
+                                "В этом форке VPN работает и на Wi-Fi, чтобы приложения оставались в туннеле.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                         Switch(
-                            checked = stopOnWifi,
+                            checked = false,
+                            enabled = false,
                             onCheckedChange = { enabled ->
                                 scope.launch { settingsStore.saveStopOnWifi(enabled) }
                             }
@@ -1190,10 +1191,7 @@ fun SettingsTabContent(
                             fontWeight = FontWeight.Medium
                         )
                         Text(
-                            "Оба варианта — полноценный VPN (весь трафик через туннель), отличается только " +
-                                "транспортный протокол. WireGuard — основной, проверенный. Raw — без " +
-                                "WireGuard вообще, эксперимент, нужен сервер с -listen-raw. SOCKS5 — без " +
-                                "VPN-разрешения, прокси вручную.",
+                            "Системный VPN с WireGuard. Поддерживает постоянную VPN и блокировку подключений без VPN в настройках Android.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -1209,28 +1207,6 @@ fun SettingsTabContent(
                                     }
                                 },
                                 label = { Text("WG") },
-                                enabled = !tunnelRunning,
-                                modifier = Modifier.weight(1f)
-                            )
-                            FilterChip(
-                                selected = connectionMode == SettingsStore.CONNECTION_MODE_RAWTUN,
-                                onClick = {
-                                    if (!tunnelRunning) {
-                                        scope.launch { settingsStore.saveConnectionMode(SettingsStore.CONNECTION_MODE_RAWTUN) }
-                                    }
-                                },
-                                label = { Text("Raw") },
-                                enabled = !tunnelRunning,
-                                modifier = Modifier.weight(1f)
-                            )
-                            FilterChip(
-                                selected = connectionMode == SettingsStore.CONNECTION_MODE_SOCKS,
-                                onClick = {
-                                    if (!tunnelRunning) {
-                                        scope.launch { settingsStore.saveConnectionMode(SettingsStore.CONNECTION_MODE_SOCKS) }
-                                    }
-                                },
-                                label = { Text("SOCKS5") },
                                 enabled = !tunnelRunning,
                                 modifier = Modifier.weight(1f)
                             )
@@ -1535,7 +1511,7 @@ fun SettingsTabContent(
 
                                 OutlinedButton(
                                     onClick = {
-                                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/SpaceNeuroX/proxy-turn-vk-android"))
+                                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/avanturist888/proxy-turn-vk-android"))
                                         context.startActivity(intent)
                                     },
                                     shape = RoundedCornerShape(8.dp),
@@ -1980,28 +1956,6 @@ fun SettingsTabContent(
                         }
                     },
                     label = { Text("WG") },
-                    enabled = !tunnelRunning,
-                    modifier = Modifier.weight(1f)
-                )
-                FilterChip(
-                    selected = connectionMode == SettingsStore.CONNECTION_MODE_RAWTUN,
-                    onClick = {
-                        if (!tunnelRunning) {
-                            scope.launch { settingsStore.saveConnectionMode(SettingsStore.CONNECTION_MODE_RAWTUN) }
-                        }
-                    },
-                    label = { Text("Raw") },
-                    enabled = !tunnelRunning,
-                    modifier = Modifier.weight(1f)
-                )
-                FilterChip(
-                    selected = connectionMode == SettingsStore.CONNECTION_MODE_SOCKS,
-                    onClick = {
-                        if (!tunnelRunning) {
-                            scope.launch { settingsStore.saveConnectionMode(SettingsStore.CONNECTION_MODE_SOCKS) }
-                        }
-                    },
-                    label = { Text("SOCKS5") },
                     enabled = !tunnelRunning,
                     modifier = Modifier.weight(1f)
                 )

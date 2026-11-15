@@ -19,11 +19,11 @@ android {
     compileSdk = 35
     
     defaultConfig {
-        applicationId = "net.qwdtt.client"
+        applicationId = "net.qwdtt.client.fork"
         minSdk = 28
         targetSdk = 35
-        versionCode = 42
-        versionName = "1.4.4"
+        versionCode = 43
+        versionName = "1.4.4.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -166,6 +166,7 @@ tasks.named("preBuild").configure {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
     implementation("androidx.compose.ui:ui")

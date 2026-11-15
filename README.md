@@ -1,12 +1,15 @@
 # qWDTT
 
+**This is qWDTT Fork.** See [fork setup, migration and recovery behavior](FORK.md).
+Download fork builds from [our releases](https://github.com/avanturist888/proxy-turn-vk-android/releases).
+
 qWDTT — Android-приложение для подключения к собственному VPS через TURN-инфраструктуру звонков VK.
 
 Приложение создаёт системный VPN-туннель на телефоне, передаёт зашифрованный трафик через VK TURN и выпускает его в интернет через ваш сервер. Для сети такое соединение похоже на медиатрафик звонка WebRTC, а не на обычное прямое подключение к VPN-серверу.
 
 ## Быстрый старт
 
-1. Скачайте APK в разделе [Releases](https://github.com/SpaceNeuroX/proxy-turn-vk-android/releases).
+1. Скачайте APK в разделе [Releases](https://github.com/avanturist888/proxy-turn-vk-android/releases).
 2. Добавьте VPS на вкладке «Серверы» и выполните установку серверной части.
 3. Создайте профиль подключения или импортируйте готовую ссылку.
 4. Добавьте хеш звонка VK.
@@ -14,8 +17,8 @@ qWDTT — Android-приложение для подключения к собс
 
 ## Сборки
 
-- стабильные подписанные версии публикуются в [GitHub Releases](https://github.com/SpaceNeuroX/proxy-turn-vk-android/releases);
-- тестовые debug-сборки ветки `develop` доступны в [GitHub Actions](https://github.com/SpaceNeuroX/proxy-turn-vk-android/actions/workflows/android-debug.yml).
+- стабильные подписанные версии публикуются в [GitHub Releases](https://github.com/avanturist888/proxy-turn-vk-android/releases);
+- тестовые debug-сборки ветки `develop` доступны в [GitHub Actions](https://github.com/avanturist888/proxy-turn-vk-android/actions/workflows/android-debug.yml).
 
 ## Обсуждение и поддержка
 

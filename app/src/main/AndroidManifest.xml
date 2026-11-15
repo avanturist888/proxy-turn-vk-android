@@ -16,7 +16,7 @@
         android:name=".WdttApplication"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
-        android:label="qWDTT"
+        android:label="qWDTT Fork"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"
@@ -90,15 +90,15 @@
                 android:value="persistent_vpn_tunnel_transport" />
         </service>
 
+        <!-- Only one selectable VpnService: the protected full-tunnel entry. -->
+        <service android:name="com.wireguard.android.backend.GoBackend$VpnService" tools:node="remove" />
         <service
-            android:name=".RawTunVpnService"
-            android:exported="false"
+            android:name=".AlwaysOnVpnService"
+            android:exported="true"
             android:permission="android.permission.BIND_VPN_SERVICE">
-            <intent-filter>
-                <action android:name="android.net.VpnService" />
-            </intent-filter>
+            <intent-filter><action android:name="android.net.VpnService" /></intent-filter>
+            <meta-data android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON" android:value="true" />
         </service>
-
 
         <activity
             android:name=".ManlCaptchaActivity"
@@ -128,7 +128,7 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
-                <action android:name="net.qwdtt.client.ACTION_TOGGLE" />
+                <action android:name="net.qwdtt.client.fork.ACTION_TOGGLE" />
             </intent-filter>
             <meta-data
                 android:name="android.appwidget.provider"

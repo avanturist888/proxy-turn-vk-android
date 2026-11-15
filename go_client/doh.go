@@ -143,8 +143,12 @@ func newDoHBootstrapDialer() *net.Dialer {
 	return &net.Dialer{
 		Timeout:   5 * time.Second,
 		KeepAlive: 30 * time.Second,
+		Control:   transportControl,
 		Resolver: &net.Resolver{
-			PreferGo: false, // системный DNS, не DoH — иначе рекурсия
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				return transportDialer(3*time.Second).DialContext(ctx, network, "1.1.1.1:53")
+			},
 		},
 	}
 }
@@ -334,4 +338,3 @@ func setupDoHResolver(arg string, endpoints []string) {
 		},
 	}
 }
-	

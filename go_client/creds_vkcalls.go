@@ -139,6 +139,7 @@ func getVKCredsViaVKCallsPath(ctx context.Context, link string, streamID int) (s
 	nameEnc := neturl.QueryEscape(name)
 
 	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(),
+		tlsclient.WithDialer(*transportDialer(20 * time.Second)),
 		tlsclient.WithTimeoutSeconds(20),
 		tlsclient.WithClientProfile(profiles.Chrome_146),
 		tlsclient.WithCookieJar(tlsclient.NewCookieJar()),

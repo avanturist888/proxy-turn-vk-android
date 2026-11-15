@@ -101,6 +101,7 @@ class SettingsStore(context: Context) {
         private val SPLIT_TUNNEL_WHITELIST_MIGRATED = booleanPreferencesKey("split_tunnel_whitelist_migrated")
         /** Обход VPN: IP/CIDR/wildcard/домены, по одному на строку. */
         private val BYPASS_ROUTES = stringPreferencesKey("bypass_routes")
+        private val ALLOW_DIRECT_BYPASS = booleanPreferencesKey("allow_direct_bypass")
 
         // ═══ Theme Mode ═══
         private val THEME_MODE = stringPreferencesKey("theme_mode") // "system", "light", "dark"
@@ -169,6 +170,7 @@ class SettingsStore(context: Context) {
         }
 
         fun normalizeConnectionMode(mode: String?): String {
+            if (FORCE_FULL_TUNNEL) return CONNECTION_MODE_VPN
             return when {
                 mode.equals(CONNECTION_MODE_SOCKS, ignoreCase = true) -> CONNECTION_MODE_SOCKS
                 mode.equals(CONNECTION_MODE_RAWTUN, ignoreCase = true) -> CONNECTION_MODE_RAWTUN
@@ -385,6 +387,8 @@ class SettingsStore(context: Context) {
     // ═══ VPN Exclusions Mode ═══
     val isWhitelist: Flow<Boolean> = dataStore.data.map { it[IS_WHITELIST] ?: false }
     val bypassRoutes: Flow<String> = dataStore.data.map { it[BYPASS_ROUTES] ?: "" }
+    // Imported exclusions never silently weaken the default full tunnel.
+    val allowDirectBypass: Flow<Boolean> = dataStore.data.map { it[ALLOW_DIRECT_BYPASS] ?: false }
 
     // ═══ Theme Mode ═══
     val hasSeenWelcomeDialog: Flow<Boolean> = dataStore.data
@@ -742,6 +746,10 @@ class SettingsStore(context: Context) {
 
     suspend fun saveBypassRoutes(raw: String) {
         dataStore.edit { prefs -> prefs[BYPASS_ROUTES] = raw.trim() }
+    }
+
+    suspend fun saveAllowDirectBypass(enabled: Boolean) {
+        dataStore.edit { prefs -> prefs[ALLOW_DIRECT_BYPASS] = enabled }
     }
 
     suspend fun saveExceptionsMode(packages: String, isWhitelist: Boolean) {

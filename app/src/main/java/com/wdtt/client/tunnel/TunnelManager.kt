@@ -590,6 +590,14 @@ object TunnelManager {
                 // Set LD_LIBRARY_PATH
                 val env = pb.environment()
                 env["LD_LIBRARY_PATH"] = context.applicationInfo.nativeLibraryDir
+                withContext(Dispatchers.Main) {
+                    context.startService(android.content.Intent(context, AlwaysOnVpnService::class.java))
+                }
+                var protectSocket = TransportSocketProtector.name()
+                repeat(50) {
+                    if (protectSocket == null) { delay(100); protectSocket = TransportSocketProtector.name() }
+                }
+                env["WDTT_PROTECT_SOCKET"] = protectSocket ?: error("VPN socket protector did not start")
 
                 process = pb.start()
                 processStartedAtMs = System.currentTimeMillis()
@@ -1294,7 +1302,7 @@ object TunnelManager {
                     } else if (System.currentTimeMillis() - zeroWorkersSince > 90_000 && !ManlCaptchaWebViewManager.isCaptchaPending) {
                         updateLog("watchdog", "⚠ Зомби-процесс (0 воркеров 90с). Перезапуск...", 50, true)
                         forceRegenerateUA = true
-                        reconnectAll("зомби-процесс")
+                        restartTransport("зомби-процесс")
                         return@launch
                     }
                 } else {
@@ -1316,7 +1324,7 @@ object TunnelManager {
                             50,
                             true
                         )
-                        reconnectAll("зависшее соединение")
+                        restartTransport("зависшее соединение")
                         return@launch
                     }
                 }
@@ -1336,8 +1344,8 @@ object TunnelManager {
         val now = System.currentTimeMillis()
         return running.value &&
             activeWorkers.value > 0 &&
-            lastStatsReceivedAtMs > 0L &&
-            now - lastStatsReceivedAtMs <= maxAgeMs
+            lastDownlinkChangedAtMs > 0L &&
+            now - lastDownlinkChangedAtMs <= maxAgeMs
     }
 
     fun hasDownlinkTrafficSince(sinceMs: Long): Boolean = lastDownlinkChangedAtMs >= sinceMs

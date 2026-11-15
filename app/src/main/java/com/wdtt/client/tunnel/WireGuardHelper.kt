@@ -70,41 +70,43 @@ class WireGuardHelper(context: Context) {
             }
             builder.parsePrivateKey(parsedConfig.`interface`.keyPair.privateKey.toBase64())
 
-            // WDTT and VK calls must stay outside the VPN transport path.
+            // Only transport sockets bypass VPN; application UIDs are captured.
             val settingsStore = SettingsStore(appContext)
             settingsStore.migrateLegacyWhitelistMode()
-            if (FORCE_FULL_TUNNEL) {
+            val allowDirect = settingsStore.allowDirectBypass.first()
+            if (!allowDirect) {
                 Log.w("WG", "FORCE_FULL_TUNNEL: игнорирую фильтр приложений — весь трафик через туннель")
-                val transportOnly = setOf(appContext.packageName, "com.vkontakte.android", "com.vk.calls")
-                    .filter { it.isInstalledPackage() }
-                    .toSet()
-                if (transportOnly.isNotEmpty()) {
-                    builder.excludeApplications(transportOnly)
-                }
+                // Transport is protected per socket; no application UID bypass.
             } else {
                 val savedExcluded = settingsStore.excludedApps.first()
                 val isWhitelist = settingsStore.isWhitelist.first()
                 val userSelected = savedExcluded.split(",").filter { it.isNotEmpty() }.toSet()
-                val transportPackages = setOf(appContext.packageName, "com.vkontakte.android", "com.vk.calls")
 
                 if (isWhitelist) {
                     val installedIncluded = userSelected
-                        .filter { it !in transportPackages && it.isInstalledPackage() }
+                        .filter { it.isInstalledPackage() }
                         .toSet()
                     if (installedIncluded.isEmpty()) {
                         throw IllegalStateException(EMPTY_WHITELIST_MESSAGE)
                     }
-                    builder.includeApplications(installedIncluded)
+                    builder.includeApplications(installedIncluded + appContext.packageName)
                 } else {
-                    val excluded = transportPackages.toMutableSet()
-                    excluded.addAll(userSelected)
-                    val installedExcluded = excluded.filter { it.isInstalledPackage() }.toSet()
+                    val installedExcluded = userSelected.filter {
+                        it != appContext.packageName && it.isInstalledPackage()
+                    }.toSet()
                     if (installedExcluded.isNotEmpty()) {
                         builder.excludeApplications(installedExcluded)
                     }
                 }
             }
 
+            run {
+                if (parsedConfig.`interface`.addresses.none { it.address is java.net.Inet6Address }) {
+                    // Capture IPv6 even when the gateway is IPv4-only: never fall back outside VPN.
+                    builder.parseAddresses("fd00:7764:7474::2/128")
+                }
+                if (parsedConfig.`interface`.dnsServers.isEmpty()) builder.parseDnsServers("1.1.1.1")
+            }
             val newInterface = builder.build()
 
             val peerBuilder = Peer.Builder()
@@ -117,9 +119,9 @@ class WireGuardHelper(context: Context) {
                 if (peer.persistentKeepalive.isPresent) peerBuilder.parsePersistentKeepalive(peer.persistentKeepalive.get().toString())
             }
             val bypassExcludeCount: Int
-            if (FORCE_FULL_TUNNEL) {
+            if (!allowDirect) {
                 Log.w("WG", "FORCE_FULL_TUNNEL: игнорирую bypass routes — 0.0.0.0/0")
-                peerBuilder.parseAllowedIPs("0.0.0.0/0")
+                peerBuilder.parseAllowedIPs("0.0.0.0/0, ::/0")
                 BypassRoutes.noteAppliedAllowedIps("0.0.0.0/0")
                 bypassExcludeCount = 0
             } else {
@@ -131,7 +133,7 @@ class WireGuardHelper(context: Context) {
                 if (bypass.truncated) {
                     Log.w("WG", "Bypass AllowedIPs truncated (excludes=${bypass.excludeCount})")
                 }
-                peerBuilder.parseAllowedIPs(bypass.allowedIps)
+                peerBuilder.parseAllowedIPs("${bypass.allowedIps}, ::/0")
                 BypassRoutes.noteAppliedAllowedIps(bypass.allowedIps)
                 bypassExcludeCount = bypass.excludeCount
             }
@@ -143,6 +145,8 @@ class WireGuardHelper(context: Context) {
 
             disabledByEmptyWhitelist = false
             stopSharedTunnel("previous tunnel before restart")
+            // GoBackend stops its VpnService when a tunnel goes down.
+            ensureGoBackendServiceStarted()
             val nextTunnel = WgTunnel()
             try {
                 setTunnelUpWithRetry(nextTunnel, finalConfig)
@@ -159,7 +163,7 @@ class WireGuardHelper(context: Context) {
                             fallbackPeer.parsePersistentKeepalive(peer.persistentKeepalive.get().toString())
                         }
                     }
-                    fallbackPeer.parseAllowedIPs("0.0.0.0/0")
+                    fallbackPeer.parseAllowedIPs("0.0.0.0/0, ::/0")
                     BypassRoutes.noteAppliedAllowedIps("0.0.0.0/0")
                     finalConfig = Config.Builder()
                         .setInterface(newInterface)
@@ -171,7 +175,8 @@ class WireGuardHelper(context: Context) {
                 }
             }
             sharedTunnel = nextTunnel
-            BypassRoutes.startAutoRefresh(TunnelManager.scope, appContext) {
+            BypassRoutes.stopAutoRefresh()
+            if (allowDirect) BypassRoutes.startAutoRefresh(TunnelManager.scope, appContext) {
                 TunnelManager.addNetworkLog("[ОБХОД] IP доменов изменились — обновляю маршруты VPN")
                 TunnelManager.reloadWireGuard()
             }
@@ -232,13 +237,17 @@ class WireGuardHelper(context: Context) {
     private suspend fun ensureGoBackendServiceStarted() {
         withContext(Dispatchers.Main) {
             runCatching {
-                val intent = Intent(appContext, GoBackend.VpnService::class.java)
+                val intent = Intent(appContext, AlwaysOnVpnService::class.java)
                 appContext.startService(intent)
             }.onFailure {
                 Log.w("WG", "GoBackend service warmup failed: ${it.readableMessage()}")
             }
         }
-        delay(300)
+        repeat(40) {
+            if (TransportSocketProtector.name() != null) return
+            delay(50)
+        }
+        check(TransportSocketProtector.name() != null) { "Transport protector unavailable" }
     }
 
     private suspend fun stopSharedTunnel(reason: String) {

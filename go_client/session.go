@@ -138,16 +138,17 @@ func dialTURNConn(turnAddr string, tcp bool) (net.PacketConn, io.Closer, error) 
 		if err != nil {
 			return nil, nil, fmt.Errorf("резолв TURN: %w", err)
 		}
-		c, err := net.DialUDP("udp", nil, resolved)
+		conn, err := protectedDial(context.Background(), "udp", resolved.String())
 		if err != nil {
 			return nil, nil, fmt.Errorf("подключение TURN UDP: %w", err)
 		}
+		c := conn.(*net.UDPConn)
 		_ = c.SetReadBuffer(socketBufSize)
 		_ = c.SetWriteBuffer(socketBufSize)
 		return &connectedUDPConn{c}, c, nil
 	}
 
-	d := net.Dialer{Timeout: 10 * time.Second}
+	d := transportDialer(10 * time.Second)
 	c, err := d.Dial("tcp", turnAddr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("подключение TURN TCP: %w", err)

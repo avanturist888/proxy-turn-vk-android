@@ -378,6 +378,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 	}
 
 	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(),
+		tlsclient.WithDialer(*transportDialer(20 * time.Second)),
 		tlsclient.WithTimeoutSeconds(20),
 		tlsclient.WithClientProfile(profiles.Chrome_146),
 		tlsclient.WithCookieJar(jar),
@@ -871,6 +872,7 @@ func setupGlobalResolver(arg string) {
 	dialer := &net.Dialer{
 		Timeout:   3 * time.Second,
 		KeepAlive: 30 * time.Second,
+		Control:   transportControl,
 	}
 	servers := goDNSServersForArg(arg)
 	log.Printf(

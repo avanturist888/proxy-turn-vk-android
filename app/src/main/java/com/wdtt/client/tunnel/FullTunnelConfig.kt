@@ -1,7 +1,7 @@
 package com.wdtt.client
 
 /**
- * Включает принудительный полный туннель для диагностических сборок.
- * В релизной конфигурации должен оставаться выключенным.
+ * Always use Android's VPN backend (never a local SOCKS-only connection).
+ * Explicit direct exclusions are a separate, opt-in setting.
  */
-const val FORCE_FULL_TUNNEL = false
+const val FORCE_FULL_TUNNEL = true

@@ -73,6 +73,20 @@ private enum class ExceptionsPane { Routes, Apps }
 private val BypassCardShape = RoundedCornerShape(24.dp)
 private val BypassControlShape = RoundedCornerShape(14.dp)
 
+@Composable
+private fun DirectBypassSwitch(enabled: Boolean, onChange: (Boolean) -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Разрешить выбранные исключения напрямую", modifier = Modifier.weight(1f))
+            Switch(checked = enabled, onCheckedChange = onChange)
+        }
+        Text(
+            "Только выбранные ниже приложения и IPv4-адреса/сайты. Автоматического определения российских сайтов нет. Android «Блокировать подключения без VPN» блокирует прямой обход: для исключений эту настройку нужно отключить, и защита от утечек при обрыве ослабнет.",
+            style = MaterialTheme.typography.bodySmall
+        )
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ExceptionsTab() {
@@ -80,6 +94,26 @@ fun ExceptionsTab() {
     val scope = rememberCoroutineScope()
     val settingsStore = remember { SettingsStore(context) }
     val colors = MaterialTheme.colorScheme
+    val allowDirect by settingsStore.allowDirectBypass.collectAsStateWithLifecycle(initialValue = false)
+    val setAllowDirect: (Boolean) -> Unit = { enabled ->
+        scope.launch {
+            settingsStore.saveAllowDirectBypass(enabled)
+            TunnelManager.reloadWireGuard()
+        }
+    }
+    if (!allowDirect) {
+        Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Text("Полный туннель", style = MaterialTheme.typography.titleLarge)
+            Text("Приложения, DNS и IPv6 направляются в VPN. Сохранённые исключения отключены.")
+            Text("В настройках Android включите «Постоянная VPN» и «Блокировать подключения без VPN», чтобы приложения ждали восстановления туннеля без выхода напрямую.")
+            Button(onClick = {
+                context.startActivity(android.content.Intent(android.provider.Settings.ACTION_VPN_SETTINGS)
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+            }) { Text("Настройки VPN Android") }
+            DirectBypassSwitch(false, setAllowDirect)
+        }
+        return
+    }
 
     var pane by rememberSaveable { mutableStateOf(ExceptionsPane.Routes) }
 
@@ -297,6 +331,7 @@ fun ExceptionsTab() {
             .fillMaxSize()
             .padding(horizontal = 16.dp)
     ) {
+        DirectBypassSwitch(true, setAllowDirect)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
