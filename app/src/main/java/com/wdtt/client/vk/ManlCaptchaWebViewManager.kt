@@ -321,7 +321,7 @@ class ManlCaptchaActivity : ComponentActivity() {
                                     @JavascriptInterface
                                     fun onCancelAndStop() {
                                         Log.d("ManlCaptchaWV", "User clicked VK Close. Stopping tunnel.")
-                                        TunnelManager.stop()
+                                        TunnelControl.stop(this@ManlCaptchaActivity)
                                         ManlCaptchaWebViewManager.notifyResult(Result.failure(Exception("Cancelled and stopped by user")))
                                         finish()
                                     }
@@ -373,7 +373,7 @@ class ManlCaptchaActivity : ComponentActivity() {
 
 class CaptchaCancelReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        TunnelManager.stop()
+        TunnelControl.stop(context)
         ManlCaptchaWebViewManager.activeActivity?.finish()
         val notifMgr = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         notifMgr.cancel(9001) // NOTIFICATION_ID
