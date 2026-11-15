@@ -11,5 +11,6 @@ RUN curl -fL --retry 3 https://dl.google.com/android/repository/commandlinetools
  && mv /opt/android-sdk/cmdline-tools/cmdline-tools /opt/android-sdk/cmdline-tools/latest \
  && rm /tmp/android-tools.zip
 RUN yes | sdkmanager --licenses >/dev/null
-RUN sdkmanager 'platforms;android-35' 'build-tools;36.0.0' 'platform-tools' 'ndk;27.2.12479018'
+RUN sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018'
+RUN sdkmanager 'build-tools;36.0.0' 'platform-tools'
 WORKDIR /workspace
