@@ -79,6 +79,10 @@ does not request a connection, even when Android always-on is enabled. A newly
 accepted manual command retires the previous recovery loop before loading settings.
 Manual parameters are tried first, followed by every saved candidate: matching only
 a host/password does not remove a saved profile with different ports or hashes.
+Reader retirement includes its control-flow children and captured subprocess;
+replacement publication waits for them before reusing the VPN. Applying a saved
+profile commits connection fields, encrypted password and selected identity in
+one settings transaction, including when recovery is cancelled.
 
 ## Integration and validation
 

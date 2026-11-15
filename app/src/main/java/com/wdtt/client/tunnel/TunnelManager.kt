@@ -40,7 +40,7 @@ object TunnelManager {
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var process: Process? = null
-    private var readerJob: Job? = null
+    private val readerJobs = OwnedJobs<Process>()
     private var watchdogJob: Job? = null
     private var detailedLogsJob: Job? = null
     private var wgHelper: WireGuardHelper? = null
@@ -136,7 +136,7 @@ object TunnelManager {
     private var cooldownJob: Job? = null
     private var startJob: Job? = null
     private var reconnectJob: Job? = null
-    private val reloadJobs = mutableSetOf<Job>()
+    private val reloadJobs = OwnedJobs<Unit>()
     @Volatile private var interactiveAuth = true
     @Volatile private var retiringWarmOwner: android.net.VpnService? = null
     private var stopJob: Job? = null
@@ -302,6 +302,7 @@ object TunnelManager {
         }
         
         val reloadsToRetire = retireReloads()
+        val readersToRetire = readerJobs.cancelSnapshot()
         val appContext = context.applicationContext // Защита от Memory Leak
         
         if (!isSwitching) {
@@ -362,6 +363,7 @@ object TunnelManager {
                 // иначе новый старт может поднять WireGuard/Raw поверх ещё не
                 // до конца погашенного предыдущего интерфейса.
                 stopJob?.join()
+                finishTransportStop(RetiredTransport(null, readersToRetire))
                 reloadsToRetire.forEach { it.join() }
                 connectionGeneration.requireCurrent(generation)
                 isDetailedLogsEnabled = runCatching {
@@ -439,7 +441,7 @@ object TunnelManager {
                 }
 
                 withContext(Dispatchers.IO) {
-                    ensureTransportStopped(params.port)
+                    ensureTransportStopped(params.port, generation)
                     connectionGeneration.requireCurrent(generation)
                     VkCaptchaProfile.writeForGo(appContext)
                 }
@@ -682,8 +684,7 @@ object TunnelManager {
     @SuppressLint("StaticFieldLeak")
     private fun startLogReader(observedProcess: Process, generation: Long) {
         fun current() = connectionGeneration.get() == generation && process === observedProcess
-        readerJob?.cancel()
-        readerJob = scope.launch {
+        val readerJob = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
             if (!current()) return@launch
             val reader = observedProcess.inputStream.bufferedReader()
             var collectingConfig = false
@@ -694,7 +695,7 @@ object TunnelManager {
             try {
                 var lastResetTime = System.currentTimeMillis()
 
-                reader.forEachLine { line ->
+                reader.forEachLine { line -> synchronized(startGate) {
                     if (!current()) return@forEachLine
                     // Периодический сброс счетчиков ошибок (раз в 60 сек)
                     val now = System.currentTimeMillis()
@@ -1211,31 +1212,35 @@ object TunnelManager {
                             updateLog("go_unhandled_${lineTrim.hashCode()}", "[Go] $lineTrim", 3, isError)
                         }
                     }
-                }
+                } }
             } catch (e: Exception) {
                 if (current() && !transportRestartInProgress) {
                     updateLog("sys_error", "Процесс остановлен: ${e.message}", -1, true)
                 }
             } finally {
-                // Если процесс умер сам, ловим код выхода
-                try {
-                    val exitCode = observedProcess.exitValue()
-                    if (current() && exitCode != 0 && !transportRestartInProgress) {
-                        updateLog("sys_exit", "Процесс крашнулся с кодом $exitCode", 99, true)
+                synchronized(startGate) {
+                    // Если процесс умер сам, ловим код выхода
+                    try {
+                        val exitCode = observedProcess.exitValue()
+                        if (current() && exitCode != 0 && !transportRestartInProgress) {
+                            updateLog("sys_exit", "Процесс крашнулся с кодом $exitCode", 99, true)
+                        }
+                    } catch (_: IllegalThreadStateException) {
+                        if (current() && !transportRestartInProgress) {
+                            observedProcess.destroy()
+                        }
                     }
-                } catch (_: IllegalThreadStateException) {
-                    if (current() && !transportRestartInProgress) {
-                        observedProcess.destroy()
-                    }
-                }
-                if (current()) {
-                    process = null
-                    if (!transportRestartInProgress) {
-                        markRunning(false)
+                    if (current()) {
+                        process = null
+                        if (!transportRestartInProgress) {
+                            markRunning(false)
+                        }
                     }
                 }
             }
         }
+        readerJobs.track(readerJob, observedProcess)
+        readerJob.start()
     }
 
     private fun handleCriticalError(message: String, generation: Long = connectionGeneration.get()) {
@@ -1390,7 +1395,7 @@ object TunnelManager {
                     updateLog("reconnect", "Reconnecting ($reason)", 50, false)
                     try {
                         val previousConfig = config.value?.trim()
-                        ensureTransportStopped(params.port)
+                        ensureTransportStopped(params.port, generation)
                         connectionGeneration.requireCurrent(generation)
                         keepWireGuardOnNextConfig = preserveVpn
                         preservedWireGuardConfig = if (preserveVpn) previousConfig else null
@@ -1480,13 +1485,12 @@ object TunnelManager {
 
     // Убивает процесс без изменения running
     private fun killProcess() {
-        watchdogJob?.cancel()
-        readerJob?.cancel()
-        stopGoProcessGracefully()
+        val retired = synchronized(startGate) { detachTransport() }
+        stopCapturedProcesses(retired)
     }
 
-    private fun stopGoProcessGracefully(proc: Process? = process) {
-        if (process === proc) process = null
+    private fun stopGoProcessGracefully(proc: Process?) {
+        synchronized(startGate) { if (process === proc) process = null }
         if (proc == null) return
         try {
             proc.outputStream.write("STOP\n".toByteArray(Charsets.UTF_8))
@@ -1545,8 +1549,34 @@ object TunnelManager {
         )
     }
 
-    private suspend fun ensureTransportStopped(port: Int) {
-        killProcess()
+    private data class RetiredTransport(val process: Process?, val readers: List<Pair<Job, Process>>)
+
+    /** Must hold startGate; captured processes can be stopped without touching replacements. */
+    private fun detachTransport(): RetiredTransport {
+        watchdogJob?.cancel()
+        val readers = readerJobs.cancelSnapshot()
+        val captured = process
+        process = null
+        return RetiredTransport(captured, readers)
+    }
+
+    private fun stopCapturedProcesses(retired: RetiredTransport) {
+        (listOfNotNull(retired.process) + retired.readers.map { it.second }).distinct()
+            .forEach { stopGoProcessGracefully(it) }
+    }
+
+    private suspend fun finishTransportStop(retired: RetiredTransport) {
+        stopCapturedProcesses(retired)
+        retired.readers.forEach { it.first.join() }
+    }
+
+    private suspend fun ensureTransportStopped(port: Int, generation: Long) {
+        val retired = synchronized(startGate) {
+            connectionGeneration.requireCurrent(generation)
+            detachTransport()
+        }
+        finishTransportStop(retired)
+        connectionGeneration.requireCurrent(generation)
         waitForUdpPortFree(port)
     }
 
@@ -1591,6 +1621,7 @@ object TunnelManager {
         }
         val stoppedGeneration = connectionGeneration.incrementAndGet()
         val reloadsToRetire = retireReloads()
+        val readersToRetire = readerJobs.cancelSnapshot()
         val previousStop = stopJob
         val reconnectSnapshot = reconnectJob
         reconnectJob = null
@@ -1613,7 +1644,6 @@ object TunnelManager {
         // в фоновую корутину (stopJob); следующий start() дожидается именно
         // stopJob, а не блокирует вызывающий (обычно главный) поток.
         watchdogJob?.cancel()
-        readerJob?.cancel()
         markRunning(false)
         isConnecting.value = false
         activeWorkers.value = 0
@@ -1634,8 +1664,8 @@ object TunnelManager {
             previousStop?.join()
             reconnectSnapshot?.join()
             startSnapshot?.join()
+            finishTransportStop(RetiredTransport(processSnapshot, readersToRetire))
             reloadsToRetire.forEach { it.join() }
-            runCatching { stopGoProcessGracefully(processSnapshot) }
             if (paramsSnapshot?.isRawTunMode == true) {
                 val ctx = lastContext?.get()
                 if (ctx != null) {
@@ -1660,16 +1690,13 @@ object TunnelManager {
                 helper.reloadTunnel(savedConfig)
                 connectionGeneration.requireCurrent(generation)
             }
-            reloadJobs.add(job)
-            job.invokeOnCompletion { synchronized(startGate) { reloadJobs.remove(job) } }
+            reloadJobs.track(job, Unit)
             job.start()
         }
     }
 
     /** Called under startGate; teardown joins these before shutting down WireGuard. */
-    private fun retireReloads(): List<Job> = reloadJobs.toList().also { jobs ->
-        jobs.forEach { it.cancel() }
-    }
+    private fun retireReloads(): List<Job> = reloadJobs.cancelSnapshot().map { it.first }
 
     // ==================== CAPTCHA SOLVER (WebView Mode) ====================
 

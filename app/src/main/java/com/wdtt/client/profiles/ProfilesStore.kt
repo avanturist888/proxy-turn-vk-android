@@ -473,18 +473,6 @@ class ProfilesStore(context: Context) {
     // Apply profile: save to SettingsStore
     suspend fun applyProfile(context: Context, id: String) {
         val p = getProfileOnce(id) ?: return
-        // save to settings
-        val finalHashes = if (p.useGlobalHashes) {
-            val global = settings.globalVkHashes.first()
-            global.ifEmpty { p.vkHashes }
-        } else {
-            p.vkHashes
-        }
-        val manualPorts = settings.manualPortsEnabled.first()
-        val serverDtlsPort = if (manualPorts) settings.serverDtlsPort.first() else 56000
-        val peerWithPort = PeerAddress.ensurePort(p.peer, serverDtlsPort)
-        settings.save(peerWithPort, finalHashes, "", p.workersPerHash, "udp", p.listenPort)
-        settings.saveConnectionPassword(p.password)
-        settings.saveCurrentProfile(p.id, p.name)
+        settings.applyConnectionProfile(p)
     }
 }

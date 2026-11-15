@@ -556,20 +556,35 @@ class SettingsStore(context: Context) {
         sni: String = "",
     ) {
         dataStore.edit { prefs ->
-            val cleanVkHashes = vkHashes.split(Regex("[,\\s\\n]+"))
-                .map { stripVkUrlStatic(it) }
-                .filter { it.isNotBlank() }
-                .distinct()
-                .joinToString(",")
-
-            prefs[PEER] = peer
-            prefs[VK_HASHES] = cleanVkHashes
-            prefs[SECONDARY_VK_HASH] = secondaryVkHash
-            prefs[WORKERS_PER_HASH] = workersPerHash
-            prefs[PROTOCOL] = protocol
-            prefs[LISTEN_PORT] = listenPort
-            prefs[SNI] = sni
+            prefs.putConnection(peer, vkHashes, secondaryVkHash, workersPerHash, protocol, listenPort, sni)
         }
+    }
+
+    /** Connection, encrypted password and selected identity commit together or not at all. */
+    suspend fun applyConnectionProfile(profile: ConnectionProfile) {
+        dataStore.edit { prefs ->
+            val hashes = if (profile.useGlobalHashes) {
+                (prefs[GLOBAL_VK_HASHES] ?: "").ifEmpty { profile.vkHashes }
+            } else profile.vkHashes
+            val serverPort = if (prefs[MANUAL_PORTS_ENABLED] == true) prefs[SERVER_DTLS_PORT] ?: 56000 else 56000
+            prefs.putConnection(PeerAddress.ensurePort(profile.peer, serverPort), hashes, "",
+                profile.workersPerHash, "udp", profile.listenPort, "")
+            prefs.putSecret(CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, profile.password)
+            prefs[CURRENT_PROFILE_ID] = profile.id
+            prefs[CURRENT_PROFILE_NAME] = profile.name
+        }
+    }
+
+    private fun MutablePreferences.putConnection(peer: String, vkHashes: String, secondaryVkHash: String,
+        workersPerHash: Int, protocol: String, listenPort: Int, sni: String) {
+        this[PEER] = peer
+        this[VK_HASHES] = vkHashes.split(Regex("[,\\s\\n]+"))
+            .map { stripVkUrlStatic(it) }.filter { it.isNotBlank() }.distinct().joinToString(",")
+        this[SECONDARY_VK_HASH] = secondaryVkHash
+        this[WORKERS_PER_HASH] = workersPerHash
+        this[PROTOCOL] = protocol
+        this[LISTEN_PORT] = listenPort
+        this[SNI] = sni
     }
 
     suspend fun saveManualPortsEnabled(enabled: Boolean) {
