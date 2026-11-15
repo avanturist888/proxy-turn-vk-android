@@ -44,18 +44,14 @@ class TunnelService : Service() {
     // Network Monitoring
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    private var networkRecoveryJob: Job? = null
+    private val underlyingNetwork = UnderlyingNetworkState()
     private var lastNetworkRecoveryAttemptMs = 0L
     private var screenStateReceiver: BroadcastReceiver? = null
     private var wakeRecoveryJob: Job? = null
-    private var wakeGraceUntilMs = 0L
     private var screenOffAtMs = 0L
     private var deviceWasInteractive = true
     private val activeNetworks = java.util.concurrent.ConcurrentHashMap.newKeySet<Network>()
     private val networkFingerprints = java.util.concurrent.ConcurrentHashMap<Network, String>()
-    private var lastUnderlyingFingerprint = ""
-    @Volatile private var isTunnelPaused = false
-    private var recoveringFromNetworkLoss = false
     private var lastVpnReconnectAttemptMs = 0L
     private var wasOnWifi = false
 
@@ -313,7 +309,22 @@ class TunnelService : Service() {
             val profiles = ProfilesStore(applicationContext)
             val selected = SettingsStore(applicationContext).currentProfileId.first()
             var firstAttempt = initialParams != null
-            while (isActive && automaticRequested) {
+            recoveryCycle@ while (isActive && automaticRequested) {
+                if (!underlyingNetwork.current.available) {
+                    // Requested connectivity outlives any individual process or network.
+                    // Do not spend server budgets or leave old sockets alive while offline.
+                    TunnelManager.stop(force = true)
+                    firstAttempt = false
+                    updateNotification("Ожидание сети...")
+                    underlyingNetwork.awaitAvailable()
+                }
+                // Coalesce address, route and capability updates for the same transition.
+                var networkSnapshot = underlyingNetwork.current
+                while (underlyingNetwork.awaitChange(networkSnapshot.revision, 2_000)) {
+                    networkSnapshot = underlyingNetwork.current
+                }
+                if (!networkSnapshot.available) continue@recoveryCycle
+                val networkRevision = networkSnapshot.revision
                 val candidates = profiles.profiles.first().filter { it.peer.isNotBlank() }
                 val savedOrder = if (initialParams == null) candidates.map { it.id }
                     else recoveryProfileOrder(candidates.map { it.id }, selected)
@@ -345,7 +356,7 @@ class TunnelService : Service() {
                             if (explicitFirstAttempt) 120_000L else 20_000L)
                         var connected = false
                         while (isActive && automaticRequested) {
-                            delay(1000)
+                            if (underlyingNetwork.awaitChange(networkRevision, 1000)) break
                             if (budget.expired(android.os.SystemClock.elapsedRealtime(),
                                     TunnelManager.controlPlaneBootstrapInProgress)) break
                             if (!TunnelManager.controlPlaneBootstrapInProgress && TunnelManager.hasSessionVpn() &&
@@ -354,7 +365,7 @@ class TunnelService : Service() {
                         val policy = RecoveryPolicy()
                         var busyBudget: RecoveryBudget? = null
                         while (isActive && automaticRequested && connected) {
-                            delay(5000)
+                            if (underlyingNetwork.awaitChange(networkRevision, 5000)) break
                             val now = android.os.SystemClock.elapsedRealtime()
                             val busy = TunnelManager.isConnecting.value || TunnelManager.isReconnecting.value ||
                                 TunnelManager.controlPlaneBootstrapInProgress
@@ -373,9 +384,13 @@ class TunnelService : Service() {
                     } finally {
                         if (recoveryRequest.get() == request) TunnelManager.stop(force = true)
                     }
+                    if (underlyingNetwork.current.revision != networkRevision) {
+                        TunnelManager.addNetworkLog("[СЕТЬ] Сеть изменилась. Запускаем новую попытку подключения.")
+                        continue@recoveryCycle
+                    }
                 }
                 // Bad credentials/interactive challenges do not create repeated prompt loops.
-                if (automaticRequested) delay(60_000)
+                if (automaticRequested) underlyingNetwork.awaitChange(networkRevision, 60_000)
             }
         }
     }
@@ -416,27 +431,20 @@ class TunnelService : Service() {
     private fun setupNetworkCallback() {
         connectivityManager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
         activeNetworks.clear()
+        connectivityManager?.allNetworks?.filter { network ->
+            val caps = connectivityManager?.getNetworkCapabilities(network)
+            caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+        }?.let { activeNetworks.addAll(it) }
+        noteUnderlyingNetworkChange()
         
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 super.onAvailable(network)
-                val wasEmpty = activeNetworks.isEmpty()
                 activeNetworks.add(network)
                 rememberNetworkFingerprint(network)
                 checkWifiStopOnTransition()
-                if (wasEmpty) {
-                    if (isTunnelPaused) {
-                        isTunnelPaused = false
-                        Log.d("TunnelService", "Сеть появилась, возобновляем туннель")
-                        recoveringFromNetworkLoss = true
-                        updateNotification("Ожидание сети...")
-                        scheduleNetworkReturnRecovery()
-                    } else {
-                        noteUnderlyingNetworkChange()
-                    }
-                } else {
-                    noteUnderlyingNetworkChange()
-                }
+                noteUnderlyingNetworkChange()
             }
 
             override fun onLost(network: Network) {
@@ -444,16 +452,7 @@ class TunnelService : Service() {
                 activeNetworks.remove(network)
                 networkFingerprints.remove(network)
                 checkWifiStopOnTransition()
-                if (activeNetworks.isEmpty() && TunnelManager.running.value && !isTunnelPaused) {
-                    isTunnelPaused = true
-                    recoveringFromNetworkLoss = true
-                    lastUnderlyingFingerprint = ""
-                    Log.d("TunnelService", "Сеть потеряна, приостанавливаем туннель")
-                    TunnelManager.pause()
-                    updateNotification("Ожидание сети...")
-                } else {
-                    noteUnderlyingNetworkChange()
-                }
+                noteUnderlyingNetworkChange()
             }
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
@@ -540,15 +539,7 @@ class TunnelService : Service() {
     }
 
     private fun noteUnderlyingNetworkChange() {
-        val fingerprint = activeUnderlyingFingerprint()
-        if (fingerprint.isEmpty()) return
-        if (lastUnderlyingFingerprint.isEmpty()) {
-            lastUnderlyingFingerprint = fingerprint
-            return
-        }
-        if (fingerprint == lastUnderlyingFingerprint) return
-        lastUnderlyingFingerprint = fingerprint
-        handleNetworkChange()
+        underlyingNetwork.update(activeUnderlyingFingerprint())
     }
 
     private fun checkWifiStopOnTransition() {
@@ -563,54 +554,6 @@ class TunnelService : Service() {
             TunnelManager.addNetworkLog("[СЕТЬ] Wi‑Fi: туннель отключён (опция «Отключать на Wi‑Fi»)")
             launch(Dispatchers.Main) { stopTunnel() }
         }
-    }
-
-    private fun handleNetworkChange() {
-        TunnelManager.scope.launch {
-            if (recoveringFromNetworkLoss) {
-                scheduleNetworkReturnRecovery()
-            } else {
-                scheduleNetworkRecovery()
-            }
-        }
-    }
-
-    private fun scheduleNetworkReturnRecovery() {
-        networkRecoveryJob?.cancel()
-        networkRecoveryJob = TunnelManager.scope.launch {
-            if (!TunnelManager.running.value || isTunnelPaused) return@launch
-            TunnelManager.addNetworkLog("[СЕТЬ] Сеть появилась. Ждём подтверждения и стабилизации.")
-            delay(5_000)
-            val validationDeadline = System.currentTimeMillis() + 25_000L
-            while (!hasUsableUnderlyingNetwork() && System.currentTimeMillis() < validationDeadline) {
-                if (!TunnelManager.running.value || isTunnelPaused) return@launch
-                delay(1_000)
-            }
-            if (!TunnelManager.running.value || isTunnelPaused || !hasUsableUnderlyingNetwork()) return@launch
-            recoveringFromNetworkLoss = false
-            wasOnWifi = isUnderlyingWifiActive()
-            performNetworkRecovery("сеть появилась")
-        }
-    }
-
-    private fun scheduleNetworkRecovery() {
-        networkRecoveryJob?.cancel()
-        networkRecoveryJob = TunnelManager.scope.launch {
-            if (!TunnelManager.running.value || isTunnelPaused) return@launch
-            TunnelManager.addNetworkLog("[СЕТЬ] Сеть изменилась. Ждём стабилизации и переподключаемся.")
-            delay(4_000)
-            if (!TunnelManager.running.value || isTunnelPaused ||
-                System.currentTimeMillis() < wakeGraceUntilMs || !hasUsableUnderlyingNetwork()) return@launch
-            performNetworkRecovery("смена сети")
-        }
-    }
-
-    private suspend fun performNetworkRecovery(reason: String) {
-        if (!TunnelManager.running.value || isTunnelPaused || !hasUsableUnderlyingNetwork()) return
-        lastNetworkRecoveryAttemptMs = System.currentTimeMillis()
-        updateNotification("Переподключение...")
-        TunnelManager.addNetworkLog("[СЕТЬ] Пересоздаём VPN и транспорт для новой сети.")
-        TunnelManager.restartTransport(reason, force = true)
     }
 
     private fun hasUsableUnderlyingNetwork(): Boolean {
@@ -631,7 +574,6 @@ class TunnelService : Service() {
                         screenOffAtMs = System.currentTimeMillis()
                         wakeRecoveryJob?.cancel()
                         wakeRecoveryJob = null
-                        wakeGraceUntilMs = 0L
                         TunnelManager.addNetworkLog("[СОН] Экран выключен. Не перезапускаем VPN из-за фоновых событий сети.")
                     }
                     Intent.ACTION_SCREEN_ON -> {
@@ -654,21 +596,19 @@ class TunnelService : Service() {
         wakeRecoveryJob?.cancel()
         val restartRawTransport = TunnelManager.isRawTunModeActive() &&
             screenOffDurationMs >= RAW_WAKE_RESTART_THRESHOLD_MS
-        wakeGraceUntilMs = System.currentTimeMillis() + if (restartRawTransport) 45_000L else 30_000L
         wakeRecoveryJob = TunnelManager.scope.launch {
-            if (!TunnelManager.running.value || isTunnelPaused) return@launch
+            if (!TunnelManager.running.value) return@launch
             if (restartRawTransport) {
-                networkRecoveryJob?.cancel()
                 TunnelManager.addNetworkLog("[СОН] RAW был в фоне ${screenOffDurationMs / 1000} сек. Обновляем транспортные потоки.")
                 val validationDeadline = System.currentTimeMillis() + 20_000L
                 while (!hasUsableUnderlyingNetwork() && System.currentTimeMillis() < validationDeadline) {
-                    if (!deviceWasInteractive || !TunnelManager.running.value || isTunnelPaused) return@launch
+                    if (!deviceWasInteractive || !TunnelManager.running.value) return@launch
                     delay(500)
                 }
-                if (!deviceWasInteractive || !TunnelManager.running.value || isTunnelPaused ||
+                if (!deviceWasInteractive || !TunnelManager.running.value ||
                     !hasUsableUnderlyingNetwork()) return@launch
                 delay(2_000)
-                if (!deviceWasInteractive || !TunnelManager.running.value || isTunnelPaused) return@launch
+                if (!deviceWasInteractive || !TunnelManager.running.value) return@launch
                 lastNetworkRecoveryAttemptMs = System.currentTimeMillis()
                 updateNotification("Восстановление после сна...")
                 TunnelManager.restartTransport("пробуждение RAW после сна", force = true)
@@ -676,7 +616,7 @@ class TunnelService : Service() {
             }
             TunnelManager.addNetworkLog("[СОН] Устройство проснулось; даём текущему VPN восстановиться без перезапуска.")
             delay(30_000)
-            if (!deviceWasInteractive || !TunnelManager.running.value || isTunnelPaused || !hasUsableUnderlyingNetwork()) return@launch
+            if (!deviceWasInteractive || !TunnelManager.running.value || !hasUsableUnderlyingNetwork()) return@launch
             if (TunnelManager.hasRecentTransportActivity(45_000L)) {
                 TunnelManager.addNetworkLog("[СОН] VPN подал свежие признаки жизни после пробуждения.")
                 return@launch
@@ -755,7 +695,7 @@ class TunnelService : Service() {
 
             val reconnectObserver = launch {
                 TunnelManager.isReconnecting.collectLatest { reconnecting ->
-                    if (reconnecting && TunnelManager.running.value && !isTunnelPaused) {
+                    if (reconnecting && TunnelManager.running.value) {
                         updateNotification("Переподключение...")
                     }
                 }
@@ -768,7 +708,7 @@ class TunnelService : Service() {
                         delay(2000)
                         continue
                     }
-                    if (!TunnelManager.running.value && !isTunnelPaused) {
+                    if (!TunnelManager.running.value) {
                         if (TunnelManager.isReconnecting.value || TunnelManager.transportRestartInProgress) {
                             delay(2000)
                             continue
@@ -785,7 +725,7 @@ class TunnelService : Service() {
                         stopSelf()
                         break
                     }
-                    if (TunnelManager.running.value && !isTunnelPaused && !TunnelManager.isSocksModeActive() &&
+                    if (TunnelManager.running.value && !TunnelManager.isSocksModeActive() &&
                         !TunnelManager.controlPlaneBootstrapInProgress) {
                         val helper = WireGuardHelper(applicationContext)
                         when (helper.watchdogState()) {
@@ -808,7 +748,7 @@ class TunnelService : Service() {
                             }
                         }
                     }
-                    if (!isTunnelPaused && !TunnelManager.isReconnecting.value) {
+                    if (!TunnelManager.isReconnecting.value) {
                         updateNotification(buildTunnelNotificationText())
                     }
                     delay(2000)
@@ -897,7 +837,6 @@ class TunnelService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        networkRecoveryJob?.cancel()
         wakeRecoveryJob?.cancel()
         screenStateReceiver?.let { unregisterReceiver(it) }
         networkCallback?.let {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"golang.org/x/sys/unix"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -22,7 +23,7 @@ func TestUnavailableProtectorFailsClosed(t *testing.T) {
 }
 
 func TestProtectionRequiresAcknowledgement(t *testing.T) {
-	for _, ack := range []byte{0, 1} {
+	for _, ack := range []byte{0, 1, 2, 3, 4, 5} {
 		t.Run(string(rune('0'+ack)), func(t *testing.T) {
 			// Abstract Unix socket, as used by the Android protection bridge.
 			name := fmt.Sprintf("wdtt_protect_test_%d", time.Now().UnixNano())
@@ -71,6 +72,9 @@ func TestProtectionRequiresAcknowledgement(t *testing.T) {
 			err = protectTransportFD(name, fd)
 			if (err == nil) != (ack == 1) {
 				t.Fatalf("ack=%d err=%v", ack, err)
+			}
+			if ack == 2 && !strings.Contains(err.Error(), "no available underlying network") {
+				t.Fatal("missing network must be distinguishable from a DNS provider failure")
 			}
 			if !<-seen {
 				t.Fatal("socket descriptor not delivered")

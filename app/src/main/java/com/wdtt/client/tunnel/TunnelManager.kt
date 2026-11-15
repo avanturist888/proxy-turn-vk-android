@@ -67,11 +67,17 @@ object TunnelManager {
     private val reconnectMutex = Mutex()
     private val controlPlane = ControlPlaneBootstrap()
     private val connectionGeneration = SessionGeneration()
+    private val recoveryState = TransportRecoveryState()
     val controlPlaneBootstrapInProgress: Boolean get() = controlPlane.active
-    @Volatile private var keepWireGuardOnNextConfig = false
-    @Volatile private var preservedWireGuardConfig: String? = null
-    @Volatile
-    private var preserveVpnDuringReconnect = false
+    private var keepWireGuardOnNextConfig: Boolean
+        get() = recoveryState.keepWireGuardOnNextConfig
+        set(value) { recoveryState.keepWireGuardOnNextConfig = value }
+    private var preservedWireGuardConfig: String?
+        get() = recoveryState.preservedWireGuardConfig
+        set(value) { recoveryState.preservedWireGuardConfig = value }
+    private var preserveVpnDuringReconnect: Boolean
+        get() = recoveryState.preservingVpn
+        set(value) { recoveryState.preservingVpn = value }
 
     private const val STALE_STATS_MS = 90_000L
     private const val HEALTH_CHECK_GRACE_MS = 120_000L
@@ -112,12 +118,12 @@ object TunnelManager {
     fun hasSessionVpn(): Boolean = configuredGeneration == connectionGeneration.get() && running.value
     val stats = MutableStateFlow("Ожидание данных...")
     val activeWorkers = MutableStateFlow(0)
-    val isReconnecting = MutableStateFlow(false)
+    val isReconnecting = recoveryState.reconnecting
     val connectionPipeline = MutableStateFlow(ConnectionPipelineState())
     /** Плановый рестарт транспорта (смена сети): log reader не должен сбрасывать running. */
-    @Volatile
-    var transportRestartInProgress: Boolean = false
-        private set
+    var transportRestartInProgress: Boolean
+        get() = recoveryState.restarting
+        private set(value) { recoveryState.restarting = value }
 
     fun formatUptime(elapsedMs: Long): String {
         val totalSec = (elapsedMs.coerceAtLeast(0L)) / 1000L
@@ -354,6 +360,7 @@ object TunnelManager {
         wgHelper = WireGuardHelper(appContext)
 
             val generation = connectionGeneration.incrementAndGet()
+            val precedingStop = stopJob
             interactiveAuth = allowInteractiveAuth
             startJob = scope.launch {
             try {
@@ -362,7 +369,7 @@ object TunnelManager {
                 // runBlocking, а запускает teardown в stopJob асинхронно) —
                 // иначе новый старт может поднять WireGuard/Raw поверх ещё не
                 // до конца погашенного предыдущего интерфейса.
-                stopJob?.join()
+                precedingStop?.join()
                 finishTransportStop(RetiredTransport(null, readersToRetire))
                 reloadsToRetire.forEach { it.join() }
                 connectionGeneration.requireCurrent(generation)
@@ -669,6 +676,7 @@ object TunnelManager {
     }
 
     private fun handleSwitchingStartFailed(reason: String, generation: Long) {
+        synchronized(startGate) {
         if (connectionGeneration.get() != generation) return
         if (!preserveVpnDuringReconnect) {
             handleReconnectFailed(reason, generation)
@@ -679,6 +687,7 @@ object TunnelManager {
         isConnecting.value = false
         markRunning(true)
         updateLog("soft_reconnect_fail", "⚠ Мягкое восстановление не удалось: $reason", 99, true)
+        }
     }
 
     @SuppressLint("StaticFieldLeak")
@@ -1389,29 +1398,36 @@ object TunnelManager {
                     val now = System.currentTimeMillis()
                     if (!force && now - lastReconnectAtMs < MIN_RECONNECT_INTERVAL_MS) return@withLock
                     lastReconnectAtMs = now
-                    isReconnecting.value = true
-                    transportRestartInProgress = true
-                    preserveVpnDuringReconnect = preserveVpn
+                    connectionGeneration.withCurrent(generation) {
+                        isReconnecting.value = true
+                        transportRestartInProgress = true
+                        preserveVpnDuringReconnect = preserveVpn
+                    }
                     updateLog("reconnect", "Reconnecting ($reason)", 50, false)
                     try {
-                        val previousConfig = config.value?.trim()
+                        val previousConfig = connectionGeneration.withCurrent(generation) { config.value?.trim() }
                         ensureTransportStopped(params.port, generation)
                         connectionGeneration.requireCurrent(generation)
-                        keepWireGuardOnNextConfig = preserveVpn
-                        preservedWireGuardConfig = if (preserveVpn) previousConfig else null
                         if (!preserveVpn) wgHelper?.stopTunnel()
+                        val acceptedStart = synchronized(startGate) {
+                            connectionGeneration.requireCurrent(generation)
+                            keepWireGuardOnNextConfig = preserveVpn
+                            preservedWireGuardConfig = if (preserveVpn) previousConfig else null
+                            activeWorkers.value = 0
+                            processStartedAtMs = 0L
+                            lastActiveAtMs = 0L
+                            lastStatsReceivedAtMs = 0L
+                            resetTransportTrafficHealth()
+                            markRunning(false)
+                            config.value = null
+                            val nextGeneration = start(context, params, isSwitching = true,
+                                expectedGeneration = generation, allowInteractiveAuth = false)
+                                ?: return@withLock
+                            nextGeneration to startJob
+                        }
+                        generation = acceptedStart.first
                         connectionGeneration.requireCurrent(generation)
-                        activeWorkers.value = 0
-                        processStartedAtMs = 0L
-                        lastActiveAtMs = 0L
-                        lastStatsReceivedAtMs = 0L
-                        resetTransportTrafficHealth()
-                        markRunning(false)
-                        config.value = null
-                        generation = start(context, params, isSwitching = true, expectedGeneration = generation,
-                            allowInteractiveAuth = false) ?: return@withLock
-                        connectionGeneration.requireCurrent(generation)
-                        startJob?.join()
+                        acceptedStart.second?.join()
                         connectionGeneration.requireCurrent(generation)
                         if (currentParams == null || process == null) return@withLock
                         awaitWireGuardReady()
@@ -1423,10 +1439,12 @@ object TunnelManager {
                             handleSwitchingStartFailed(e.message ?: e::class.java.simpleName, generation)
                         }
                     } finally {
-                        if (connectionGeneration.get() == generation) {
-                            preserveVpnDuringReconnect = false
-                            transportRestartInProgress = false
-                            isReconnecting.value = false
+                        synchronized(startGate) {
+                            if (connectionGeneration.get() == generation) {
+                                preserveVpnDuringReconnect = false
+                                transportRestartInProgress = false
+                                isReconnecting.value = false
+                            }
                         }
                     }
                 }
@@ -1644,6 +1662,7 @@ object TunnelManager {
         // в фоновую корутину (stopJob); следующий start() дожидается именно
         // stopJob, а не блокирует вызывающий (обычно главный) поток.
         watchdogJob?.cancel()
+        recoveryState.reset()
         markRunning(false)
         isConnecting.value = false
         activeWorkers.value = 0
