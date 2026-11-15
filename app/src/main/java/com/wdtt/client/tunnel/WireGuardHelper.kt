@@ -1,7 +1,6 @@
 package com.wdtt.client
 
 import android.content.Context
-import android.content.Intent
 import android.net.VpnService
 import android.util.Log
 import com.wireguard.android.backend.GoBackend
@@ -193,12 +192,13 @@ class WireGuardHelper(context: Context) {
         }
     }
 
-    suspend fun reloadTunnel() = wgMutex.withLock {
+    suspend fun reloadTunnel(configString: String) = wgMutex.withLock {
         withContext(Dispatchers.IO) {
             try {
-                val configFlow = TunnelManager.config.first() ?: return@withContext
-                startTunnelLocked(configFlow)
+                startTunnelLocked(configString)
                 Log.d("WG", "WireGuard tunnel reloaded for new exceptions")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 if (e.isEmptyWhitelistFailure()) {
                     stopSharedTunnel("empty whitelist")
@@ -240,7 +240,7 @@ class WireGuardHelper(context: Context) {
         awaitRetiringOwner()
         withContext(Dispatchers.Main) {
             runCatching {
-                val intent = Intent(appContext, AlwaysOnVpnService::class.java)
+                val intent = AlwaysOnVpnService.warmupIntent(appContext)
                 appContext.startService(intent)
             }.onFailure {
                 Log.w("WG", "GoBackend service warmup failed: ${it.readableMessage()}")

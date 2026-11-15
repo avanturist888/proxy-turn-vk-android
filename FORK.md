@@ -73,6 +73,13 @@ even when startup fails before an interface exists. Sticky restarts resume only
 a persisted connection request or Android's system always-on request; explicit
 Stop clears the persisted request.
 
+Settings reloads retain their source configuration and session identity; terminal
+teardown cancels and joins them before closing WireGuard. Internal service warmup
+does not request a connection, even when Android always-on is enabled. A newly
+accepted manual command retires the previous recovery loop before loading settings.
+Manual parameters are tried first, followed by every saved candidate: matching only
+a host/password does not remove a saved profile with different ports or hashes.
+
 ## Integration and validation
 
 The old `network-recovery` branch is retained, including its previous fixes.

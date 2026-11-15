@@ -33,7 +33,8 @@ private const val RAW_WAKE_RESTART_THRESHOLD_MS = 60_000L
 
 class TunnelService : Service() {
     private var automaticJob: Job? = null
-    private val recoveryRequest = java.util.concurrent.atomic.AtomicLong()
+    private var automaticStopJob: Job? = null
+    private val recoveryRequest = RecoveryCommandGate()
     @Volatile private var automaticRequested = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -81,10 +82,19 @@ class TunnelService : Service() {
                 startPersistentForeground(notification)
 
                 val appContext = applicationContext
-                val commandRequest = if (intent.getBooleanExtra("automatic", false))
-                    intent.getLongExtra("recovery_request", -1L) else recoveryRequest.incrementAndGet()
+                val automatic = intent.getBooleanExtra("automatic", false)
+                var retiredLoop: Job? = null
+                val commandRequest = if (automatic) intent.getLongExtra("recovery_request", -1L) else {
+                    // Revoke the loop before the first settings read, not after it finishes.
+                    val accepted = recoveryRequest.beginManual()
+                    automaticRequested = false
+                    retiredLoop = retireAutomaticLoop()
+                    accepted
+                }
                 TunnelManager.scope.launch {
                     try {
+                        retiredLoop?.join()
+                        if (commandRequest != recoveryRequest.get()) return@launch
                         val store = SettingsStore(appContext)
                         SettingsStore.awaitMigrations(appContext)
                         val basePeer = intent.getStringExtra("peer")?.takeIf { it.isNotEmpty() } ?: store.peer.first()
@@ -161,6 +171,7 @@ class TunnelService : Service() {
                         launch(Dispatchers.Main) {
                             if (commandRequest != recoveryRequest.get() ||
                                 (intent.getBooleanExtra("automatic", false) && !automaticRequested)) return@launch
+                            if (!automatic && !recoveryRequest.finishManual(commandRequest)) return@launch
                             startTunnel(
                                 params,
                                 forceStart = intent.action == "START_FORCED" || intent.action == "START_SAVED",
@@ -269,10 +280,6 @@ class TunnelService : Service() {
 
     private fun startTunnel(params: TunnelParams, forceStart: Boolean = false, automaticAttempt: Boolean = false) {
         if (!automaticAttempt) {
-            recoveryRequest.incrementAndGet()
-            automaticJob?.cancel()
-            automaticJob = null
-            automaticRequested = false
             TunnelManager.stop(force = true)
         }
         RecoveryIntentStore.setRequested(this, true)
@@ -294,27 +301,27 @@ class TunnelService : Service() {
     }
 
     private fun startAutomatic(initialParams: TunnelParams? = null) {
+        if (automaticJob?.isActive == true) return // Also covers OS enabling always-on on an active VPN.
+        val loop = recoveryRequest.beginLoop() ?: return // A manual command is still loading settings.
         startPersistentForeground(createNotification("Automatic VPN recovery"))
         RecoveryIntentStore.setRequested(this, true)
-        if (automaticJob?.isActive == true) return // Also covers OS enabling always-on on an active VPN.
         automaticRequested = true
+        val retiredLoop = automaticStopJob
         automaticJob = TunnelManager.scope.launch {
+            retiredLoop?.join()
             SettingsStore.awaitMigrations(applicationContext)
             val profiles = ProfilesStore(applicationContext)
             val selected = SettingsStore(applicationContext).currentProfileId.first()
             var firstAttempt = initialParams != null
             while (isActive && automaticRequested) {
                 val candidates = profiles.profiles.first().filter { it.peer.isNotBlank() }
-                val selectedMatches = candidates.any { it.id == selected && initialParams != null &&
-                    PeerAddress.host(it.peer) == PeerAddress.host(initialParams.peer) &&
-                    it.password == initialParams.connectionPassword }
                 val savedOrder = if (initialParams == null) candidates.map { it.id }
-                    else recoveryProfileOrder(candidates.map { it.id }, if (selectedMatches) selected else "")
+                    else recoveryProfileOrder(candidates.map { it.id }, selected)
                 val targets: List<String?> = if (initialParams != null) listOf(null) + savedOrder
                     else savedOrder.ifEmpty { listOf(null) }
                 for (id in targets) {
                     if (!isActive || !automaticRequested) break
-                    val request = recoveryRequest.incrementAndGet()
+                    val request = recoveryRequest.nextAttempt(loop) ?: return@launch
                     val explicitFirstAttempt = firstAttempt
                     try {
                         if (!firstAttempt) {
@@ -373,12 +380,23 @@ class TunnelService : Service() {
         }
     }
 
+    /** A replaced command may be cancelled; its retirement barrier must survive it. */
+    private fun retireAutomaticLoop(): Job {
+        val previousStop = automaticStopJob
+        val previousLoop = automaticJob
+        automaticJob = null
+        previousLoop?.cancel()
+        return TunnelManager.scope.launch {
+            previousStop?.join()
+            previousLoop?.join()
+        }.also { automaticStopJob = it }
+    }
+
     private fun stopTunnel(explicit: Boolean = true) {
         if (explicit) RecoveryIntentStore.setRequested(this, false)
-        recoveryRequest.incrementAndGet()
+        recoveryRequest.invalidate()
         automaticRequested = false
-        automaticJob?.cancel()
-        automaticJob = null
+        retireAutomaticLoop()
         updateJob?.cancel()
 
         // Уничтожаем текущий WebView (если капча решается) и чистим контекст

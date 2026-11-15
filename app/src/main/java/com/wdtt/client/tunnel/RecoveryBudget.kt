@@ -12,11 +12,14 @@ class RecoveryBudget(private val startedAt: Long, private val attemptMs: Long = 
     }
 }
 
-/** Keep the explicit/manual parameters first, then cycle saved profiles after it. */
+/** Keep every saved candidate: a manual override need not equal its selected profile. */
 fun recoveryProfileOrder(ids: List<String>, selected: String): List<String> {
     val index = ids.indexOf(selected)
-    return if (index < 0) ids else ids.drop(index + 1) + ids.take(index)
+    return if (index < 0) ids else ids.drop(index + 1) + ids.take(index + 1)
 }
+
+fun isSystemVpnStart(serviceIntent: Boolean, stickyRestart: Boolean, alwaysOn: Boolean): Boolean =
+    serviceIntent || (stickyRestart && alwaysOn)
 
 fun shouldResumeConnection(systemStart: Boolean, stickyRestart: Boolean, requested: Boolean): Boolean =
     systemStart || (stickyRestart && requested)

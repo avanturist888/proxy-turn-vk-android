@@ -36,7 +36,7 @@ data class LogEntry(
 )
 
 object TunnelManager {
-    // 100% защита от утечек: единый управляемый глобальный Scope
+    // Shared supervisor; connection jobs carry the generation that owns their effects.
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var process: Process? = null
@@ -136,6 +136,7 @@ object TunnelManager {
     private var cooldownJob: Job? = null
     private var startJob: Job? = null
     private var reconnectJob: Job? = null
+    private val reloadJobs = mutableSetOf<Job>()
     @Volatile private var interactiveAuth = true
     @Volatile private var retiringWarmOwner: android.net.VpnService? = null
     private var stopJob: Job? = null
@@ -143,7 +144,7 @@ object TunnelManager {
     private var pipelineStepTimeoutJob: Job? = null
     @Volatile
     private var connectingStartedAtMs = 0L
-    private val startGate = Any()
+    private val startGate = connectionGeneration
     private const val CONNECT_STOP_GRACE_MS = 2_500L
     /** После успешного подключения схема скрывается, чтобы не занимать логи. */
     private const val PIPELINE_HIDE_AFTER_SUCCESS_MS = 4_000L
@@ -300,6 +301,7 @@ object TunnelManager {
             return null
         }
         
+        val reloadsToRetire = retireReloads()
         val appContext = context.applicationContext // Защита от Memory Leak
         
         if (!isSwitching) {
@@ -360,6 +362,7 @@ object TunnelManager {
                 // иначе новый старт может поднять WireGuard/Raw поверх ещё не
                 // до конца погашенного предыдущего интерфейса.
                 stopJob?.join()
+                reloadsToRetire.forEach { it.join() }
                 connectionGeneration.requireCurrent(generation)
                 isDetailedLogsEnabled = runCatching {
                     SettingsStore(appContext).detailedLogs.first()
@@ -572,22 +575,20 @@ object TunnelManager {
                 env["WDTT_PROTECT_SOCKET"] = warmTransportProtector(context)
 
                 connectionGeneration.requireCurrent(generation)
-                val startedProcess = synchronized(startGate) {
-                    connectionGeneration.requireCurrent(generation)
-                    pb.start().also { process = it }
+                connectionGeneration.withCurrent(generation) {
+                    val startedProcess = pb.start()
+                    process = startedProcess
+                    processStartedAtMs = System.currentTimeMillis()
+                    wrapAuthTimeoutCount = 0
+                    lastActiveAtMs = 0L
+                    lastStatsReceivedAtMs = System.currentTimeMillis()
+                    if (!isSwitching) transportRestartInProgress = false
+                    isConnecting.value = false
+                    markRunning(true)
+                    stats.value = "Ожидание данных..."
+                    startLogReader(startedProcess, generation)
+                    startWatchdog(appContext, params, generation)
                 }
-                processStartedAtMs = System.currentTimeMillis()
-                wrapAuthTimeoutCount = 0
-                lastActiveAtMs = 0L
-                lastStatsReceivedAtMs = System.currentTimeMillis()
-                if (!isSwitching) {
-                    transportRestartInProgress = false
-                }
-                isConnecting.value = false
-                markRunning(true)
-                stats.value = "Ожидание данных..."
-                startLogReader(startedProcess, generation)
-                startWatchdog(appContext, params)
 
             } catch (e: kotlinx.coroutines.CancellationException) {
                 if (connectionGeneration.get() == generation && !isSwitching) {
@@ -1269,8 +1270,7 @@ object TunnelManager {
     // ==================== WATCHDOG ====================
     // Проверяет, жив ли Go-процесс. Если умер — перезапускает.
     // Если процесс жив, но 0 воркеров уже 30 сек — тоже перезапуск (зомби).
-    private fun startWatchdog(context: Context, params: TunnelParams) {
-        val generation = connectionGeneration.get()
+    private fun startWatchdog(context: Context, params: TunnelParams, generation: Long) {
         watchdogJob?.cancel()
         watchdogJob = scope.launch {
             var zeroWorkersSince = 0L
@@ -1590,6 +1590,7 @@ object TunnelManager {
             }
         }
         val stoppedGeneration = connectionGeneration.incrementAndGet()
+        val reloadsToRetire = retireReloads()
         val previousStop = stopJob
         val reconnectSnapshot = reconnectJob
         reconnectJob = null
@@ -1616,6 +1617,8 @@ object TunnelManager {
         markRunning(false)
         isConnecting.value = false
         activeWorkers.value = 0
+        config.value = null
+        configuredGeneration = -1L
         // При ошибке шага оставляем схему с крестиком; иначе прячем.
         if (connectionPipeline.value.failed == null) {
             hideConnectionPipeline()
@@ -1631,6 +1634,7 @@ object TunnelManager {
             previousStop?.join()
             reconnectSnapshot?.join()
             startSnapshot?.join()
+            reloadsToRetire.forEach { it.join() }
             runCatching { stopGoProcessGracefully(processSnapshot) }
             if (paramsSnapshot?.isRawTunMode == true) {
                 val ctx = lastContext?.get()
@@ -1645,12 +1649,26 @@ object TunnelManager {
     }
 
     fun reloadWireGuard() {
-        if (controlPlaneBootstrapInProgress) return
-        if (running.value && currentParams?.isSocksMode != true) {
-            scope.launch {
-                wgHelper?.reloadTunnel()
+        synchronized(startGate) {
+            if (controlPlaneBootstrapInProgress || !running.value || currentParams?.isSocksMode == true) return
+            val generation = connectionGeneration.get()
+            val helper = wgHelper ?: return
+            val savedConfig = config.value ?: return
+            lateinit var job: Job
+            job = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+                connectionGeneration.requireCurrent(generation)
+                helper.reloadTunnel(savedConfig)
+                connectionGeneration.requireCurrent(generation)
             }
+            reloadJobs.add(job)
+            job.invokeOnCompletion { synchronized(startGate) { reloadJobs.remove(job) } }
+            job.start()
         }
+    }
+
+    /** Called under startGate; teardown joins these before shutting down WireGuard. */
+    private fun retireReloads(): List<Job> = reloadJobs.toList().also { jobs ->
+        jobs.forEach { it.cancel() }
     }
 
     // ==================== CAPTCHA SOLVER (WebView Mode) ====================
@@ -1694,9 +1712,18 @@ object TunnelManager {
         }
     }
 
-    private suspend fun releaseWarmedService(generation: Long) {
+    fun releaseUnrequestedWarmService(context: Context) {
+        synchronized(startGate) {
+            val generation = connectionGeneration.get()
+            scope.launch {
+                if (!RecoveryIntentStore.requested(context)) releaseWarmedService(generation, context)
+            }
+        }
+    }
+
+    private suspend fun releaseWarmedService(generation: Long, context: Context? = null) {
         if (connectionGeneration.get() != generation) return
-        val ctx = lastContext?.get() ?: return
+        val ctx = context ?: lastContext?.get() ?: return
         if (wgHelper?.watchdogState() == WireGuardHelper.WatchdogState.UP) return
         withContext(Dispatchers.Main) {
             synchronized(startGate) {
@@ -1718,7 +1745,7 @@ object TunnelManager {
     private suspend fun warmTransportProtector(ctx: Context): String {
         awaitRetiringWarmOwner()
         withContext(Dispatchers.Main) {
-            ctx.startService(android.content.Intent(ctx, AlwaysOnVpnService::class.java))
+            ctx.startService(AlwaysOnVpnService.warmupIntent(ctx))
         }
         repeat(50) {
             TransportSocketProtector.name()?.let { return it }

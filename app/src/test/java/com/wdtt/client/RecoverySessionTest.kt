@@ -69,9 +69,46 @@ class RecoverySessionTest {
     }
 
     @Test fun explicitParametersStayFirstAndSavedProfilesContinueAfterSelection() {
-        assertEquals(listOf("third", "first"), recoveryProfileOrder(listOf("first", "second", "third"), "second"))
+        assertEquals(listOf("third", "first", "second"), recoveryProfileOrder(listOf("first", "second", "third"), "second"))
         assertEquals(listOf("first", "second"), recoveryProfileOrder(listOf("first", "second"), "custom"))
-        assertEquals(emptyList<String>(), recoveryProfileOrder(listOf("only"), "only"))
+        assertEquals(listOf("only"), recoveryProfileOrder(listOf("only"), "only"))
+    }
+
+    @Test fun manualLoadingRevokesOldLoopAndCannotBeOvertakenBySystemStart() {
+        val requests = RecoveryCommandGate()
+        val oldLoop = requests.beginLoop()!!
+        requests.nextAttempt(oldLoop)
+        val manual = requests.beginManual()
+        assertNull(requests.nextAttempt(oldLoop))
+        assertNull(requests.beginLoop())
+        assertEquals(manual, requests.get())
+        assertTrue(requests.finishManual(manual))
+        val newLoop = requests.beginLoop()!!
+        assertNull(requests.nextAttempt(oldLoop))
+        assertNotNull(requests.nextAttempt(newLoop))
+    }
+
+    @Test fun stopRejectsQueuedManualCommandAndLateProcessPublication() {
+        val requests = RecoveryCommandGate()
+        val manual = requests.beginManual()
+        requests.invalidate()
+        assertFalse(requests.finishManual(manual))
+        val session = SessionGeneration()
+        val startup = session.incrementAndGet()
+        session.incrementAndGet()
+        var published = false
+        try {
+            session.withCurrent(startup) { published = true }
+            fail("stopped startup must not publish")
+        } catch (_: CancellationException) { }
+        assertFalse(published)
+    }
+
+    @Test fun internalWarmupNeverBecomesAnOsRequestBecauseAlwaysOnIsEnabled() {
+        assertFalse(isSystemVpnStart(false, false, true))
+        assertTrue(isSystemVpnStart(true, false, true))
+        assertTrue(isSystemVpnStart(false, true, true))
+        assertFalse(isSystemVpnStart(false, true, false))
     }
 
     @Test fun stickyServiceCannotUndoExplicitStopButSystemAlwaysOnCanStart() {
