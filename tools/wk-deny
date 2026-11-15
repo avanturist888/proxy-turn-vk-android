@@ -1,0 +1,6 @@
+^local\.properties$
+^\.keys(?:/|$)
+^\.secrets(?:/|$)
+^\.env(?:\.|$)
+\.(?:keystore|jks|p12|pfx|pem|key)$
+^(?:\.gradle|\.gradle-home|\.kotlin)(?:/|$)

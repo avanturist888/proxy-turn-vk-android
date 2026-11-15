@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -uo pipefail
+wk_store=${WK_HOME:-${LOCALAPPDATA:-}/wk}
+command -v cygpath >/dev/null 2>&1 && wk_store=$(cygpath -u "$wk_store")
+exec bash "$wk_store/core/009271f169bcb8e10727cac0d9f5fd2c381f1c75/bin/wk" "$@"

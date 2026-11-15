@@ -1,0 +1,6 @@
+WK_PROJECT=wdttandroid
+WK_HOST=worker
+WK_REPO=C:/work/wdtt-android.git
+WK_ROOT=C:/work/wdtt-android-wk
+WK_DENY=tools/wk-deny
+WK_LEASE=7200

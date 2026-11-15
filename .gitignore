@@ -13,7 +13,7 @@ app/build/
 app/release/
 
 # ===== Go =====
-go.sum
+# Each Go module keeps dependency checksums in source control.
 
 # ===== Native Libraries (compiled) =====
 *.so
@@ -55,3 +55,6 @@ wg-turn-client
 .kotlin/
 .keys/
 .gradle-home/
+
+# Machine-specific worker paths stay local.
+/tools/wk.conf
