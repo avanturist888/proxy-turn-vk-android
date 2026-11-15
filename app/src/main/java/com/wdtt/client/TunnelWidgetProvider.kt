@@ -17,9 +17,7 @@ import kotlinx.coroutines.withContext
 class TunnelWidgetProvider : AppWidgetProvider() {
 
     override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
-        for (appWidgetId in appWidgetIds) {
-            updateAppWidget(context, appWidgetManager, appWidgetId)
-        }
+        updateWidgetState(context, TunnelManager.running.value, TunnelManager.stats.value)
     }
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -94,38 +92,6 @@ class TunnelWidgetProvider : AppWidgetProvider() {
                 
                 appWidgetManager.updateAppWidget(widgetId, views)
             }
-        }
-
-        private fun updateAppWidget(context: Context, appWidgetManager: AppWidgetManager, appWidgetId: Int) {
-            val views = RemoteViews(context.packageName, R.layout.tunnel_widget)
-            val running = TunnelManager.running.value
-            val stats = TunnelManager.stats.value
-            
-            // Set initial state
-            if (running) {
-                views.setImageViewResource(R.id.widget_status_dot, R.drawable.widget_dot_green)
-                views.setTextViewText(R.id.widget_status_title, "qWDTT: Активен")
-                views.setTextViewText(R.id.widget_stats_text, stats)
-                views.setImageViewResource(R.id.widget_toggle_button, android.R.drawable.ic_media_pause)
-                views.setInt(R.id.widget_toggle_button, "setColorFilter", android.graphics.Color.parseColor("#FF5252"))
-            } else {
-                views.setImageViewResource(R.id.widget_status_dot, R.drawable.widget_dot_gray)
-                views.setTextViewText(R.id.widget_status_title, "qWDTT: Отключен")
-                views.setTextViewText(R.id.widget_stats_text, "Нажмите для подключения")
-                views.setImageViewResource(R.id.widget_toggle_button, android.R.drawable.ic_media_play)
-                views.setInt(R.id.widget_toggle_button, "setColorFilter", android.graphics.Color.parseColor("#3DDC84"))
-            }
-            
-            val intent = Intent(context, TunnelWidgetProvider::class.java).apply {
-                action = ACTION_TOGGLE
-            }
-            val pendingIntent = PendingIntent.getBroadcast(
-                context, 0, intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            views.setOnClickPendingIntent(R.id.widget_toggle_button, pendingIntent)
-            
-            appWidgetManager.updateAppWidget(appWidgetId, views)
         }
 
         private fun openVpnPermissionActivity(context: Context) {
