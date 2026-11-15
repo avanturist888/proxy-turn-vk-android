@@ -281,6 +281,7 @@ class TunnelService : Service() {
     }
 
     private fun startAutomatic() {
+        if (TunnelManager.controlPlaneBootstrapInProgress) return
         startPersistentForeground(createNotification("Автоматическое подключение VPN…"))
         if (automaticJob?.isActive == true) return
         automaticRequested = true
@@ -300,11 +301,12 @@ class TunnelService : Service() {
                             action = "START_SAVED"
                             putExtra("automatic", true)
                         })
-                        val deadline = android.os.SystemClock.elapsedRealtime() + 60_000L
+                        var deadline = android.os.SystemClock.elapsedRealtime() + 60_000L
                         var connected = false
                         while (isActive && automaticRequested && android.os.SystemClock.elapsedRealtime() < deadline) {
                             delay(2000)
-                            if (TunnelManager.running.value && TunnelManager.config.value != null && TunnelReachability.check()) {
+                            if (TunnelManager.controlPlaneBootstrapInProgress) { deadline += 2000; continue }
+                            if (TunnelManager.running.value && TunnelManager.config.value != null && TunnelReachability.check(applicationContext)) {
                                 connected = true
                                 break
                             }
@@ -312,8 +314,9 @@ class TunnelService : Service() {
                         val policy = RecoveryPolicy()
                         while (isActive && automaticRequested && connected) {
                             delay(10_000)
-                            if (TunnelManager.isConnecting.value || TunnelManager.isReconnecting.value) continue
-                            if (policy.record(TunnelManager.running.value && TunnelReachability.check(), android.os.SystemClock.elapsedRealtime())) {
+                            if (TunnelManager.isConnecting.value || TunnelManager.isReconnecting.value ||
+                                TunnelManager.controlPlaneBootstrapInProgress) continue
+                            if (policy.record(TunnelManager.running.value && TunnelReachability.check(applicationContext), android.os.SystemClock.elapsedRealtime())) {
                                 connected = false // Try next saved server; loop never enters a terminal paused state.
                             }
                         }
@@ -337,7 +340,8 @@ class TunnelService : Service() {
             delay(30_000)
             while (isActive) {
                 if (TunnelManager.running.value && !isTunnelPaused && !TunnelManager.isReconnecting.value &&
-                    policy.record(TunnelReachability.check(), android.os.SystemClock.elapsedRealtime())) {
+                    !TunnelManager.controlPlaneBootstrapInProgress &&
+                    policy.record(TunnelReachability.check(applicationContext), android.os.SystemClock.elapsedRealtime())) {
                     TunnelManager.restartTransport("нет ответа через туннель", force = true)
                 }
                 delay(10_000)
@@ -739,7 +743,8 @@ class TunnelService : Service() {
                         stopSelf()
                         break
                     }
-                    if (TunnelManager.running.value && !isTunnelPaused && !TunnelManager.isSocksModeActive()) {
+                    if (TunnelManager.running.value && !isTunnelPaused && !TunnelManager.isSocksModeActive() &&
+                        !TunnelManager.controlPlaneBootstrapInProgress) {
                         val helper = WireGuardHelper(applicationContext)
                         when (helper.watchdogState()) {
                             WireGuardHelper.WatchdogState.UP -> wasEverUp = true

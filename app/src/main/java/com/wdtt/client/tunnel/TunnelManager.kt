@@ -65,6 +65,9 @@ object TunnelManager {
     @Volatile private var lastDownlinkChangedAtMs = 0L
     private var lastReconnectAtMs = 0L
     private val reconnectMutex = Mutex()
+    private val controlPlane = ControlPlaneBootstrap()
+    private val connectionGeneration = java.util.concurrent.atomic.AtomicLong()
+    val controlPlaneBootstrapInProgress: Boolean get() = controlPlane.active
     @Volatile private var keepWireGuardOnNextConfig = false
     @Volatile private var preservedWireGuardConfig: String? = null
     @Volatile
@@ -348,6 +351,7 @@ object TunnelManager {
             }
             startJob = scope.launch {
             try {
+                connectionGeneration.incrementAndGet()
                 // Дожидаемся завершения фонового teardown от предыдущего stop()
                 // (см. stop(): он больше не блокирует вызывающий поток через
                 // runBlocking, а запускает teardown в stopJob асинхронно) —
@@ -519,48 +523,19 @@ object TunnelManager {
                     }
                 }
 
-                setConnectionPipelineCurrent(ConnectionStep.DNS)
-                var dnsProbe = GoDnsProbe.check(params.goDnsArg)
-                if (isSwitching && !dnsProbe.reachable) {
-                    for (attempt in 2..4) {
-                        updateLog(
-                            "go_dns_reconnect_wait",
-                            "[СЕТЬ] DNS ещё не готов после смены сети. Повторяем проверку ($attempt/4)...",
-                            50,
-                            false,
-                        )
-                        delay(2_000)
-                        dnsProbe = GoDnsProbe.check(params.goDnsArg)
-                        if (dnsProbe.reachable) break
-                    }
-                }
-                if (!dnsProbe.reachable) {
-                    updateLog(
-                        "go_dns_precheck_fail",
-                        "[СЕТЬ] DNS недоступен: ${dnsProbe.statusText}",
-                        50,
-                        true
-                    )
-                    failConnectionPipeline(ConnectionStep.DNS)
-                    updateLog(
-                        "go_dns_tip",
-                        "[СЕТЬ] Смените DNS в ⚙️ → Сеть (Яндекс / Cloudflare / Google / DoH / Свой)",
-                        50,
-                        true
-                    )
-                    abortStart(isSwitching, "DNS недоступен")
-                    return@launch
-                } else {
-                    updateLog("go_dns_precheck_ok", "[СЕТЬ] DNS доступен: ${dnsProbe.statusText}", 1, false)
-                    advanceConnectionPipeline(ConnectionStep.DNS, ConnectionStep.VK)
-                }
+                // Advisory Kotlin probes follow the application route. During a
+                // preserved dead VPN they cannot determine underlay DNS health.
+                // The protected Go resolver performs the actual bootstrap query.
+                advanceConnectionPipeline(ConnectionStep.DNS, ConnectionStep.VK)
 
                 if (!params.vkAuthMode.equals("anonymous", ignoreCase = true)) {
                     try {
                         stats.value = "VK: вход в звонок…"
                         updateLog("vk_auth_start", "[VK Auth] Вход в звонок…", 5, false)
                         setConnectionPipelineCurrent(ConnectionStep.VK)
-                        val credsByHash = VkAuthWebViewManager.authenticateAll(appContext, hashList)
+                        val credsByHash = withControlPlaneNetwork(appContext) {
+                            VkAuthWebViewManager.authenticateAll(appContext, hashList)
+                        }
                         val credsFile = VkAuthWebViewManager.writeCredsFile(appContext, credsByHash)
                         cmd.add("-vk-creds-file")
                         cmd.add(credsFile.absolutePath)
@@ -590,14 +565,7 @@ object TunnelManager {
                 // Set LD_LIBRARY_PATH
                 val env = pb.environment()
                 env["LD_LIBRARY_PATH"] = context.applicationInfo.nativeLibraryDir
-                withContext(Dispatchers.Main) {
-                    context.startService(android.content.Intent(context, AlwaysOnVpnService::class.java))
-                }
-                var protectSocket = TransportSocketProtector.name()
-                repeat(50) {
-                    if (protectSocket == null) { delay(100); protectSocket = TransportSocketProtector.name() }
-                }
-                env["WDTT_PROTECT_SOCKET"] = protectSocket ?: error("VPN socket protector did not start")
+                env["WDTT_PROTECT_SOCKET"] = warmTransportProtector(context)
 
                 process = pb.start()
                 processStartedAtMs = System.currentTimeMillis()
@@ -1164,6 +1132,9 @@ object TunnelManager {
                             } else {
                                 scope.launch(Dispatchers.Main) {
                                     try {
+                                        val generation = connectionGeneration.get()
+                                        while (controlPlaneBootstrapInProgress) delay(100)
+                                        if (connectionGeneration.get() != generation || currentParams == null) return@launch
                                         val keepExisting = keepWireGuardOnNextConfig &&
                                             preservedWireGuardConfig == configStr &&
                                             wgHelper?.watchdogState() == WireGuardHelper.WatchdogState.UP
@@ -1270,6 +1241,7 @@ object TunnelManager {
             var zeroWorkersSince = 0L
             delay(10_000) // Даём 10 сек на старт
             while (isActive && running.value) {
+                if (controlPlaneBootstrapInProgress) { zeroWorkersSince = 0L; delay(1000); continue }
                 val proc = process
                 if (proc == null || !proc.isAlive) {
                     // Go-процесс мёртв! применяем экспоненциальный бэкофф перед перезапуском
@@ -1364,11 +1336,13 @@ object TunnelManager {
     }
 
     fun reconnectAll(reason: String, force: Boolean = false, preserveVpn: Boolean = false) {
+        if (controlPlaneBootstrapInProgress) return
         val params = currentParams ?: return
         val context = lastContext?.get() ?: return
 
         scope.launch {
             reconnectMutex.withLock {
+                if (controlPlaneBootstrapInProgress) return@withLock
                 val now = System.currentTimeMillis()
                 if (!force && now - lastReconnectAtMs < MIN_RECONNECT_INTERVAL_MS) {
                     updateLog("reconnect_skip", "Переподключение уже выполняется…", 50, false)
@@ -1590,6 +1564,7 @@ object TunnelManager {
                 return
             }
         }
+        connectionGeneration.incrementAndGet()
         saveRemainingTraffic()
         startJob?.cancel()
         startJob = null
@@ -1633,6 +1608,7 @@ object TunnelManager {
     }
 
     fun reloadWireGuard() {
+        if (controlPlaneBootstrapInProgress) return
         if (running.value && currentParams?.isSocksMode != true) {
             scope.launch {
                 wgHelper?.reloadTunnel()
@@ -1641,6 +1617,56 @@ object TunnelManager {
     }
 
     // ==================== CAPTCHA SOLVER (WebView Mode) ====================
+
+    private suspend fun <T> withControlPlaneNetwork(ctx: Context, action: suspend () -> T): T {
+        var savedConfig: String? = null
+        val generation = connectionGeneration.get()
+        val helper = wgHelper
+        return controlPlane.run(
+            release = {
+                if (connectionGeneration.get() != generation || currentParams == null) {
+                    throw CancellationException("Stale control bootstrap")
+                }
+                if (helper?.watchdogState() == WireGuardHelper.WatchdogState.UP) {
+                    savedConfig = config.value ?: preservedWireGuardConfig
+                    check(savedConfig != null) { "Cannot release VPN without its restore configuration" }
+                    helper.stopTunnel()
+                    // GoBackend DOWN stops VpnService; let its main-thread destroy finish.
+                    delay(200)
+                }
+                if (connectionGeneration.get() != generation || currentParams == null) {
+                    throw CancellationException("Stopped before control bootstrap")
+                }
+                warmTransportProtector(ctx)
+            },
+            restore = {
+                if (connectionGeneration.get() == generation && currentParams != null) {
+                    savedConfig?.let { helper?.startTunnel(it) }
+                }
+            },
+            action = {
+                if (connectionGeneration.get() != generation || currentParams == null) {
+                    throw CancellationException("Connection stopped during control bootstrap")
+                }
+                val result = action()
+                if (connectionGeneration.get() != generation || currentParams == null) {
+                    throw CancellationException("Connection changed during control bootstrap")
+                }
+                result
+            },
+        )
+    }
+
+    private suspend fun warmTransportProtector(ctx: Context): String {
+        withContext(Dispatchers.Main) {
+            ctx.startService(android.content.Intent(ctx, AlwaysOnVpnService::class.java))
+        }
+        repeat(50) {
+            TransportSocketProtector.name()?.let { return it }
+            delay(100)
+        }
+        error("VPN socket protector did not start")
+    }
 
     /**
      * Вызывается при получении CAPTCHA_SOLVE от Go-процесса.
@@ -1660,18 +1686,20 @@ object TunnelManager {
             if (mode == "manual") {
                 VkWebViewCookies.clearCaptchaCookies()
             }
-            val token = when (mode) {
-                "auto" -> solveSingleAutoWebViewCaptcha(redirectUri, sessionToken)
-                "manual" -> {
-                    updateLog("captcha_wv_step_1", "[КАПЧА WBV] Создание ручного WebView...", 5, false)
-                    ManlCaptchaWebViewManager.solveCaptchaAsync(ctx, redirectUri, sessionToken)
-                }
-                else -> {
-                    if (currentCaptchaSolveMethod == "auto") {
-                        solveAutoWebViewCaptcha(ctx, redirectUri, sessionToken)
-                    } else {
+            val token = withControlPlaneNetwork(ctx) {
+                when (mode) {
+                    "auto" -> solveSingleAutoWebViewCaptcha(redirectUri, sessionToken)
+                    "manual" -> {
                         updateLog("captcha_wv_step_1", "[КАПЧА WBV] Создание ручного WebView...", 5, false)
                         ManlCaptchaWebViewManager.solveCaptchaAsync(ctx, redirectUri, sessionToken)
+                    }
+                    else -> {
+                        if (currentCaptchaSolveMethod == "auto") {
+                            solveAutoWebViewCaptcha(ctx, redirectUri, sessionToken)
+                        } else {
+                            updateLog("captcha_wv_step_1", "[КАПЧА WBV] Создание ручного WebView...", 5, false)
+                            ManlCaptchaWebViewManager.solveCaptchaAsync(ctx, redirectUri, sessionToken)
+                        }
                     }
                 }
             }
@@ -1760,7 +1788,7 @@ object TunnelManager {
         }
         updateLog("vk_auth_refresh", "[VK Auth] Обновление TURN для ${hash.take(8)}…", 5, false)
         try {
-            val result = VkAuthWebViewManager.authenticate(ctx, hash)
+            val result = withControlPlaneNetwork(ctx) { VkAuthWebViewManager.authenticate(ctx, hash) }
             val creds = result.getOrElse {
                 writeTurnCredsError()
                 updateLog("vk_auth_refresh_fail", "[VK Auth] Ошибка: ${it.message}", 99, true)

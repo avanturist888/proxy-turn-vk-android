@@ -35,10 +35,24 @@ VPN transport/control sockets (VK/TURN, transport DNS/DoH, WireGuard loopback)
 must reach the underlying network to build the tunnel. These narrowly protected
 sockets do not exclude the app's or VK's entire UID from VPN.
 
+Account sign-in, account TURN renewal and CAPTCHA use Android WebView, whose
+individual sockets cannot be protected by this app. During these control flows
+the fork temporarily releases an existing WireGuard interface, keeps Android's
+lockdown policy enabled, and restores the saved interface afterwards. Android
+permits the VPN application's own UID to bootstrap while ordinary apps remain
+blocked by lockdown. This interval therefore requires **Block connections without
+VPN** for fail-closed behavior; without it, other apps can use the direct network.
+Normal anonymous recovery keeps the interface when no WebView is needed. An
+advisory application DNS probe cannot veto transport startup: the protected Go
+resolver makes the actual bootstrap queries. Control flows and network recovery
+are serialized, and Stop prevents a stale flow from restoring the old interface.
+
 ## Recovery
 
 Network/address changes restart the outer transport while retaining the VPN
-interface where possible. End-to-end application TCP checks detect a dead path
+interface where possible. TCP checks bind explicitly to the current Android VPN
+network and reject a missing/changed VPN, so the VPN owner's underlay exemption
+cannot produce a false success. These checks detect a dead path
 even if local statistics keep arriving. Two failed checks trigger recovery;
 success clears the failure streak. Repeated failures are rate limited. Recovery
 does not require Android's Internet-validation probe to succeed, and continues
