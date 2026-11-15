@@ -1631,8 +1631,6 @@ object TunnelManager {
                     savedConfig = config.value ?: preservedWireGuardConfig
                     check(savedConfig != null) { "Cannot release VPN without its restore configuration" }
                     helper.stopTunnel()
-                    // GoBackend DOWN stops VpnService; let its main-thread destroy finish.
-                    delay(200)
                 }
                 if (connectionGeneration.get() != generation || currentParams == null) {
                     throw CancellationException("Stopped before control bootstrap")

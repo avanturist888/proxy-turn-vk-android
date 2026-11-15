@@ -20,7 +20,7 @@ class AlwaysOnVpnService : GoBackend.VpnService() {
     }
 
     override fun onDestroy() {
-        TransportSocketProtector.stop(this)
         super.onDestroy()
+        TransportSocketProtector.stop(this)
     }
 }

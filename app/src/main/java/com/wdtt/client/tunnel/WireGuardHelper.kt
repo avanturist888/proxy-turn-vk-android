@@ -26,6 +26,7 @@ class WireGuardHelper(context: Context) {
         val wgMutex = Mutex()
         var sharedTunnel: WgTunnel? = null
         var disabledByEmptyWhitelist = false
+        var retiringOwner: VpnService? = null
     }
 
     class WgTunnel : Tunnel {
@@ -223,18 +224,20 @@ class WireGuardHelper(context: Context) {
             try {
                 BypassRoutes.stopAutoRefresh()
                 sharedTunnel?.let {
-                    backend.setState(it, Tunnel.State.DOWN, null)
+                    setTunnelDownAndAwaitOwner(it)
                     sharedTunnel = null
                     Log.d("WG", "WireGuard tunnel stopped")
                 }
                 disabledByEmptyWhitelist = false
             } catch (e: Exception) {
                 Log.e("WG", "Failed to stop WireGuard: ${e.readableMessage()}")
+                throw e
             }
         }
     }
 
     private suspend fun ensureGoBackendServiceStarted() {
+        awaitRetiringOwner()
         withContext(Dispatchers.Main) {
             runCatching {
                 val intent = Intent(appContext, AlwaysOnVpnService::class.java)
@@ -253,13 +256,31 @@ class WireGuardHelper(context: Context) {
     private suspend fun stopSharedTunnel(reason: String) {
         sharedTunnel?.let { existingTunnel ->
             try {
-                backend.setState(existingTunnel, Tunnel.State.DOWN, null)
+                setTunnelDownAndAwaitOwner(existingTunnel)
             } catch (e: Exception) {
                 Log.w("WG", "Failed to stop tunnel for $reason: ${e.readableMessage()}")
+                throw e
             }
             sharedTunnel = null
-            delay(150)
         }
+    }
+
+    private suspend fun awaitRetiringOwner() {
+        val previous = retiringOwner ?: return
+        TransportSocketProtector.awaitOwnerReleased(previous)
+        retiringOwner = null
+    }
+
+    private suspend fun setTunnelDownAndAwaitOwner(tunnel: WgTunnel) {
+        awaitRetiringOwner()
+        val wasUp = backend.getState(tunnel) == Tunnel.State.UP
+        if (wasUp) {
+            retiringOwner = checkNotNull(TransportSocketProtector.ownerIdentity()) {
+                "Cannot stop active VPN without its service owner"
+            }
+        }
+        backend.setState(tunnel, Tunnel.State.DOWN, null)
+        awaitRetiringOwner()
     }
 
     private suspend fun setTunnelUpWithRetry(nextTunnel: WgTunnel, finalConfig: Config) {
@@ -271,7 +292,7 @@ class WireGuardHelper(context: Context) {
             } catch (e: Exception) {
                 lastError = e
                 Log.w("WG", "WireGuard UP attempt ${attempt + 1}/3 failed: ${e.readableMessage()}")
-                runCatching { backend.setState(nextTunnel, Tunnel.State.DOWN, null) }
+                setTunnelDownAndAwaitOwner(nextTunnel)
                 ensureGoBackendServiceStarted()
                 delay(250L * (attempt + 1))
             }

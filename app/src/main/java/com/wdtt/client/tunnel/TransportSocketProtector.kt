@@ -9,6 +9,8 @@ import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
 
 /** Per-socket transport exception; never excludes the application's UID. */
 object TransportSocketProtector {
@@ -52,6 +54,15 @@ object TransportSocketProtector {
     }
 
     fun name(): String? = socketName
+
+    fun ownerIdentity(): VpnService? = service
+
+    /** Completion is published only after GoBackend's onDestroy resets its future. */
+    suspend fun awaitOwnerReleased(owner: VpnService) {
+        withTimeout(3000) {
+            while (service === owner) delay(25)
+        }
+    }
 
     @Synchronized fun stop(owner: VpnService) {
         if (service === owner) stopCurrent()
