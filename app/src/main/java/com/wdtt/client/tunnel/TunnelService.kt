@@ -704,7 +704,8 @@ class TunnelService : Service() {
             try {
                 while (isActive) {
                     if (automaticRequested && !TunnelManager.running.value) {
-                        updateNotification("Ожидание доступного сервера")
+                        updateNotification(if (underlyingNetwork.current.available)
+                            "Ожидание доступного сервера" else "Ожидание сети...")
                         delay(2000)
                         continue
                     }
