@@ -33,7 +33,7 @@ class UnderlyingNetworkStateTest {
         assertFalse(state.awaitChange(current, 10))
     }
 
-    @Test fun repeatedOutagesAndAddressChangesEachInvalidateOldSockets() = runBlocking {
+    @Test fun repeatedOutagesAndAddressChangesRemainObservable() = runBlocking {
         val state = UnderlyingNetworkState()
         for (fingerprint in listOf("cell:one", "", "cell:two", "wifi:one", "wifi:two", "", "cell:three")) {
             val old = state.current.revision
@@ -54,14 +54,23 @@ class UnderlyingNetworkStateTest {
         assertFalse(started)
     }
 
-    @Test fun transportUsesPreferredWorkingPhysicalNetworkAndCanBootstrapBeforeValidation() {
-        val wifi = UnderlyingNetworkCandidate("wifi", validated = true, wifi = true)
-        val cell = UnderlyingNetworkCandidate("cell", validated = true, wifi = false)
-        assertEquals("cell", selectUnderlyingNetwork(listOf(wifi, cell), "cell"))
-        assertEquals("wifi", selectUnderlyingNetwork(listOf(cell, wifi), "vpn"))
-        val captiveWifi = wifi.copy(validated = false)
-        assertEquals("cell", selectUnderlyingNetwork(listOf(captiveWifi, cell), "vpn"))
-        assertEquals("cell", selectUnderlyingNetwork(listOf(cell.copy(validated = false)), "vpn"))
-        assertNull(selectUnderlyingNetwork(emptyList<UnderlyingNetworkCandidate<String>>(), "vpn"))
+    @Test fun onlineNetworkChurnDoesNotSignalLossOrExtendTheWait() = runBlocking {
+        val state = UnderlyingNetworkState()
+        state.update("wifi:stable|cell:one")
+        val waiting = async { state.awaitUnavailable(100) }
+        val changing = launch {
+            var revision = 0
+            while (isActive) {
+                state.update("wifi:stable|cell:${revision++}")
+                delay(1)
+            }
+        }
+        try {
+            assertFalse(withTimeout(1000) { waiting.await() })
+        } finally { changing.cancelAndJoin() }
+        val lost = async { state.awaitUnavailable(60_000) }
+        yield()
+        state.update("")
+        assertTrue(withTimeout(1000) { lost.await() })
     }
 }

@@ -86,11 +86,15 @@ one settings transaction, including when recovery is cancelled.
 
 Network availability belongs to the requested connection, not to the lifetime
 of its subprocess. The same recovery loop waits while offline and starts a fresh
-attempt after network/address changes, including during server cooldown. Terminal
+attempt after network loss/return, including during server cooldown. Terminal
 Stop clears reconnect and retained-VPN state before retiring old jobs. Transport
-sockets are individually protected and bound to a current physical network;
-validation is preferred but is not required for bootstrap under lockdown. This
-does not bypass the VPN for other application sockets.
+sockets are individually protected; Android selects the physical network without
+an application-level Wi-Fi preference or a process-wide network binding.
+Bootstrap does not require validation under lockdown. A healthy VPN stays up
+through unrelated network changes; VPN reachability detects a broken path.
+Stabilization has a fixed delay rather than waiting for every network to settle.
+Requested connection state keeps Stop available while offline or retrying.
+This does not bypass the VPN for other application sockets.
 
 ## Integration and validation
 

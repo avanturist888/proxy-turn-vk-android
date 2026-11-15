@@ -83,6 +83,7 @@ class TunnelService : Service() {
                 val commandRequest = if (automatic) intent.getLongExtra("recovery_request", -1L) else {
                     // Revoke the loop before the first settings read, not after it finishes.
                     val accepted = recoveryRequest.beginManual()
+                    RecoveryIntentStore.setRequested(this, true)
                     automaticRequested = false
                     retiredLoop = retireAutomaticLoop()
                     accepted
@@ -318,11 +319,9 @@ class TunnelService : Service() {
                     updateNotification("Ожидание сети...")
                     underlyingNetwork.awaitAvailable()
                 }
-                // Coalesce address, route and capability updates for the same transition.
-                var networkSnapshot = underlyingNetwork.current
-                while (underlyingNetwork.awaitChange(networkSnapshot.revision, 2_000)) {
-                    networkSnapshot = underlyingNetwork.current
-                }
+                // One bounded pause coalesces updates without waiting for all networks to settle.
+                delay(2_000)
+                val networkSnapshot = underlyingNetwork.current
                 if (!networkSnapshot.available) continue@recoveryCycle
                 val networkRevision = networkSnapshot.revision
                 val candidates = profiles.profiles.first().filter { it.peer.isNotBlank() }
@@ -356,7 +355,7 @@ class TunnelService : Service() {
                             if (explicitFirstAttempt) 120_000L else 20_000L)
                         var connected = false
                         while (isActive && automaticRequested) {
-                            if (underlyingNetwork.awaitChange(networkRevision, 1000)) break
+                            if (underlyingNetwork.awaitUnavailable(1000)) break
                             if (budget.expired(android.os.SystemClock.elapsedRealtime(),
                                     TunnelManager.controlPlaneBootstrapInProgress)) break
                             if (!TunnelManager.controlPlaneBootstrapInProgress && TunnelManager.hasSessionVpn() &&
@@ -365,7 +364,9 @@ class TunnelService : Service() {
                         val policy = RecoveryPolicy()
                         var busyBudget: RecoveryBudget? = null
                         while (isActive && automaticRequested && connected) {
-                            if (underlyingNetwork.awaitChange(networkRevision, 5000)) break
+                            // Online network changes alone do not invalidate a working VPN.
+                            // Real VPN reachability detects a broken path or address handover.
+                            if (underlyingNetwork.awaitUnavailable(5000)) break
                             val now = android.os.SystemClock.elapsedRealtime()
                             val busy = TunnelManager.isConnecting.value || TunnelManager.isReconnecting.value ||
                                 TunnelManager.controlPlaneBootstrapInProgress

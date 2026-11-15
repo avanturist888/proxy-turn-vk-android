@@ -22,14 +22,10 @@ class UnderlyingNetworkState {
 
     suspend fun awaitAvailable(): Snapshot = changes.first { it.available }
 
+    /** An unused network changing must not retire a working transport. */
+    suspend fun awaitUnavailable(timeoutMs: Long): Boolean =
+        withTimeoutOrNull(timeoutMs) { changes.first { !it.available } } != null
+
     suspend fun awaitChange(revision: Long, timeoutMs: Long): Boolean =
         withTimeoutOrNull(timeoutMs) { changes.first { it.revision != revision } } != null
-}
-
-data class UnderlyingNetworkCandidate<T>(val network: T, val validated: Boolean, val wifi: Boolean)
-
-/** Prefer working Wi-Fi, but do not require validation to bootstrap a locked VPN. */
-fun <T> selectUnderlyingNetwork(candidates: List<UnderlyingNetworkCandidate<T>>, preferred: T?): T? {
-    candidates.firstOrNull { it.network == preferred && it.validated }?.let { return it.network }
-    return candidates.maxByOrNull { (if (it.validated) 2 else 0) + (if (it.wifi) 1 else 0) }?.network
 }

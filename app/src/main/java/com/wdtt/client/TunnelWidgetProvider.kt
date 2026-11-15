@@ -26,7 +26,8 @@ class TunnelWidgetProvider : AppWidgetProvider() {
         super.onReceive(context, intent)
 
         if (intent.action == ACTION_TOGGLE) {
-            if (TunnelManager.running.value) {
+            if (RecoveryIntentStore.requested(context) || TunnelManager.running.value ||
+                TunnelManager.isConnecting.value || TunnelManager.isReconnecting.value) {
                 TunnelControl.stop(context)
             } else {
                 val needsVpnPermission = runCatching { VpnService.prepare(context) != null }
@@ -66,10 +67,11 @@ class TunnelWidgetProvider : AppWidgetProvider() {
                 val views = RemoteViews(context.packageName, R.layout.tunnel_widget)
                 
                 // Update status dot and title
-                if (running) {
+                if (running || RecoveryIntentStore.requested(context)) {
                     views.setImageViewResource(R.id.widget_status_dot, R.drawable.widget_dot_green)
-                    views.setTextViewText(R.id.widget_status_title, "qWDTT: Активен")
-                    views.setTextViewText(R.id.widget_stats_text, statsText ?: "Туннель запущен")
+                    views.setTextViewText(R.id.widget_status_title, if (running) "qWDTT: Активен" else "qWDTT: Ожидание")
+                    views.setTextViewText(R.id.widget_stats_text, if (running) statsText ?: "Туннель запущен"
+                        else "Ожидание подключения; нажмите для отмены")
                     views.setImageViewResource(R.id.widget_toggle_button, android.R.drawable.ic_media_pause)
                     views.setInt(R.id.widget_toggle_button, "setColorFilter", android.graphics.Color.parseColor("#FF5252")) // Red pause button
                 } else {

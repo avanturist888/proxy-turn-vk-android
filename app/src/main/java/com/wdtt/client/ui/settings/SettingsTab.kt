@@ -58,6 +58,7 @@ import com.wdtt.client.BypassRoutes
 import com.wdtt.client.SettingsStore
 import com.wdtt.client.TunnelManager
 import com.wdtt.client.TunnelService
+import com.wdtt.client.RecoveryIntentStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -149,6 +150,8 @@ fun SettingsTabContent(
     val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
     val tunnelConnecting by TunnelManager.isConnecting.collectAsStateWithLifecycle()
     val tunnelReconnecting by TunnelManager.isReconnecting.collectAsStateWithLifecycle()
+    val connectionRequested by remember(context) { RecoveryIntentStore.observe(context) }
+        .collectAsStateWithLifecycle()
     tunnelRunning || tunnelConnecting
     var connectCancelArmed by remember { mutableStateOf(false) }
     LaunchedEffect(tunnelConnecting, tunnelRunning) {
@@ -1796,7 +1799,7 @@ fun SettingsTabContent(
         val tunnelSecretsMissing = savedConnectionPassword.isBlank()
         val buttonColor by animateColorAsState(
             targetValue = when {
-                tunnelRunning -> MaterialTheme.colorScheme.error
+                connectionRequested || tunnelRunning -> MaterialTheme.colorScheme.error
                 tunnelConnecting && connectCancelArmed -> MaterialTheme.colorScheme.error
                 else -> MaterialTheme.colorScheme.primary
             },
@@ -1987,7 +1990,7 @@ fun SettingsTabContent(
                 Button(
                     onClick = {
                         when {
-                            tunnelRunning || tunnelReconnecting || (tunnelConnecting && connectCancelArmed) -> {
+                            connectionRequested || tunnelRunning || tunnelReconnecting || (tunnelConnecting && connectCancelArmed) -> {
                                 context.startService(
                                     Intent(context, TunnelService::class.java).apply { action = "STOP" }
                                 )
@@ -2001,6 +2004,7 @@ fun SettingsTabContent(
                         }
                     },
                     enabled = (isValid && cooldownSeconds == 0 && !tunnelConnecting && !tunnelReconnecting) ||
+                        connectionRequested ||
                         tunnelRunning ||
                         tunnelReconnecting ||
                         (tunnelConnecting && connectCancelArmed),
@@ -2015,7 +2019,7 @@ fun SettingsTabContent(
                 ) {
                     Icon(
                         imageVector = when {
-                            tunnelRunning || tunnelReconnecting || (tunnelConnecting && connectCancelArmed) -> Icons.Default.Stop
+                            connectionRequested || tunnelRunning || tunnelReconnecting || (tunnelConnecting && connectCancelArmed) -> Icons.Default.Stop
                             else -> Icons.Default.PowerSettingsNew
                         },
                         contentDescription = null,
@@ -2025,6 +2029,7 @@ fun SettingsTabContent(
                     Text(
                         text = when {
                             tunnelReconnecting -> "Переподключение…"
+                            connectionRequested && !tunnelRunning -> "Отмена"
                             tunnelConnecting && !tunnelRunning && !connectCancelArmed -> "Подключение…"
                             tunnelConnecting && !tunnelRunning -> "Отмена"
                             tunnelRunning -> "Остановить"

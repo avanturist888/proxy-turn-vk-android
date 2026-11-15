@@ -25,7 +25,8 @@ class QuickToggleTileService : TileService() {
     override fun onClick() {
         super.onClick()
         runCatching {
-            if (TunnelManager.running.value || TunnelManager.isConnecting.value) {
+            if (RecoveryIntentStore.requested(applicationContext) || TunnelManager.running.value ||
+                TunnelManager.isConnecting.value || TunnelManager.isReconnecting.value) {
                 TunnelControl.stop(applicationContext)
                 updateTile(false)
                 return
@@ -66,7 +67,8 @@ class QuickToggleTileService : TileService() {
     }
 
     private fun updateTileState() {
-        if (TunnelManager.isConnecting.value || TunnelManager.isReconnecting.value) {
+        if (TunnelManager.isConnecting.value || TunnelManager.isReconnecting.value ||
+            (RecoveryIntentStore.requested(applicationContext) && !TunnelManager.running.value)) {
             updateTileConnecting()
         } else {
             updateTile(TunnelManager.running.value)
@@ -75,7 +77,7 @@ class QuickToggleTileService : TileService() {
 
     private fun updateTileConnecting() {
         val tile = qsTile ?: return
-        tile.state = Tile.STATE_UNAVAILABLE
+        tile.state = Tile.STATE_ACTIVE // The tile must remain clickable to cancel recovery.
         tile.label = "qWDTT"
         if (Build.VERSION.SDK_INT >= 29) {
             tile.subtitle = "Подключение…"
