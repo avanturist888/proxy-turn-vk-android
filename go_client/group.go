@@ -79,36 +79,26 @@ func WorkerGroup(
 	var configRequestInFlight int32
 	var wg sync.WaitGroup
 	var credsMu sync.RWMutex
-	var refreshMu sync.Mutex
-	var lastCredRefresh atomic.Int64
+	var refreshCooldown credentialRefreshCooldown
 
 	refreshCreds := func(reason string) bool {
-		refreshMu.Lock()
-		defer refreshMu.Unlock()
+		return refreshCooldown.run(ctx, func() bool {
+			getStreamCache(credStreamID).invalidate(credStreamID)
+			if getVkAuthMode() == "account" {
+				invalidateInjectedTurnCreds(hash)
+			}
+			u, p, urls, refreshErr := GetCreds(ctx, hash, credStreamID)
+			if refreshErr != nil {
+				log.Printf("[TURN] Не удалось обновить креды после %s: %v", reason, refreshErr)
+				return false
+			}
 
-		now := time.Now().Unix()
-		last := lastCredRefresh.Load()
-		if last > 0 && now-last < 15 {
-			log.Printf("[TURN] Креды уже обновлялись %d сек назад, ждём следующий retry (%s)", now-last, reason)
+			credsMu.Lock()
+			creds = &Credentials{User: u, Pass: p, TurnURLs: urls, CacheStreamID: credStreamID}
+			credsMu.Unlock()
+			log.Printf("[TURN] Креды обновлены после %s, TURN urls=%d", reason, len(urls))
 			return true
-		}
-
-		getStreamCache(credStreamID).invalidate(credStreamID)
-		if getVkAuthMode() == "account" {
-			invalidateInjectedTurnCreds(hash)
-		}
-		u, p, urls, refreshErr := GetCreds(ctx, hash, credStreamID)
-		if refreshErr != nil {
-			log.Printf("[TURN] Не удалось обновить креды после %s: %v", reason, refreshErr)
-			return false
-		}
-
-		credsMu.Lock()
-		creds = &Credentials{User: u, Pass: p, TurnURLs: urls, CacheStreamID: credStreamID}
-		credsMu.Unlock()
-		lastCredRefresh.Store(time.Now().Unix())
-		log.Printf("[TURN] Креды обновлены после %s, TURN urls=%d", reason, len(urls))
-		return true
+		})
 	}
 
 	// Сигнализируем следующей группе, что мы успешно запустились (креды получены + фора)
@@ -150,6 +140,7 @@ func WorkerGroup(
 
 			shouldGetConfig := getConfig
 			attempt := 0
+			var retry workerRetryState
 
 			for {
 				if ctx.Err() != nil {
@@ -170,11 +161,12 @@ func WorkerGroup(
 				credsSnapshot.TurnURLs = cloneStringSlice(creds.TurnURLs)
 				credsMu.RUnlock()
 
+				sessionStarted := time.Now()
 				configDelivered, sessErr := RunSession(ctx, tp, peer, d, localPort,
 					getConf, cc, wid, &credsSnapshot, deviceID, password, stats, allocateTicker.C)
 
 				quotaRetry := false
-				fastRetry := false
+				var retryPlan workerRetryPlan
 				if getConf {
 					if configDelivered {
 						atomic.StoreInt32(&configSent, 1)
@@ -189,14 +181,11 @@ func WorkerGroup(
 					}
 					errStr := sessErr.Error()
 					errStrLower := strings.ToLower(errStr)
-					fastRetry = strings.Contains(errStrLower, "broken pipe") ||
-						strings.Contains(errStrLower, "connection reset by peer") ||
-						strings.Contains(errStrLower, "unexpected eof")
-
 					turnAllocAttrMissing := strings.Contains(errStrLower, "turn allocate") &&
 						strings.Contains(errStrLower, "attribute not found")
 					isTurnQuota := strings.Contains(errStrLower, "quota") || strings.Contains(errStr, "486")
 					quotaRetry = isTurnQuota
+					retryPlan = retry.next(quotaRetry, time.Since(sessionStarted), getVkAuthMode() == "account")
 					turnCredRefreshNeeded := !isTurnQuota && (turnAllocAttrMissing ||
 						strings.Contains(errStrLower, "turn allocate auth") ||
 						strings.Contains(errStrLower, "invalid credential") ||
@@ -221,7 +210,10 @@ func WorkerGroup(
 
 					attempt++
 					if isTurnQuota {
-						log.Printf("[ВОРКЕР #%d] [TURN] Квота relay исчерпана (один аккаунт VK = мало слотов), ждём: %s", wid, errStr)
+						log.Printf("[ВОРКЕР #%d] [TURN] Квота relay исчерпана, повтор через %v: %s", wid, retryPlan.delay.Truncate(time.Second), errStr)
+						if retryPlan.refreshQuotaCreds {
+							refreshCreds("TURN quota")
+						}
 					} else if turnAllocAttrMissing {
 						log.Printf("[ВОРКЕР #%d] [TURN] Allocate вернул неполный ответ, обновляем TURN-креды и повторяем (попытка %d): %s", wid, attempt, errStr)
 						refreshCreds("TURN Allocate attribute-not-found")
@@ -246,15 +238,10 @@ func WorkerGroup(
 					return
 				}
 
-				retryDelay := time.Duration(5+rand.Intn(11)) * time.Second
-				if quotaRetry {
-					retryDelay = time.Duration(30+rand.Intn(31)) * time.Second
-				} else if fastRetry {
-					retryDelay = time.Duration(1+rand.Intn(3)) * time.Second
+				if sessErr == nil {
+					retryPlan = retry.next(false, time.Since(sessionStarted), getVkAuthMode() == "account")
 				}
-				select {
-				case <-time.After(retryDelay):
-				case <-ctx.Done():
+				if waitForRetry(ctx, retryPlan.delay) != nil {
 					return
 				}
 			}

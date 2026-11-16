@@ -595,6 +595,9 @@ class TunnelService : Service() {
 
     private fun scheduleWakeRecovery(screenOffDurationMs: Long) {
         wakeRecoveryJob?.cancel()
+        // The automatic loop already checks actual VPN reachability and bounds
+        // recovery. A second wake timer must not tear down a healthy Raw tunnel.
+        if (automaticRequested) return
         val restartRawTransport = TunnelManager.isRawTunModeActive() &&
             screenOffDurationMs >= RAW_WAKE_RESTART_THRESHOLD_MS
         wakeRecoveryJob = TunnelManager.scope.launch {

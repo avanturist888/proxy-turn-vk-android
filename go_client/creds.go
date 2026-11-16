@@ -269,32 +269,15 @@ func getVkCredsCached(ctx context.Context, link string, streamID int) (string, s
 
 // ─── Serialized (throttled) fetcher ───
 
-var (
-	vkRequestMu           sync.Mutex
-	globalLastVkFetchTime time.Time
-)
+var vkRequestGate = newCredentialRequestGate()
 
 func fetchVkCredsSerialized(ctx context.Context, link string, streamID int) (string, string, []string, error) {
-	vkRequestMu.Lock()
-	defer vkRequestMu.Unlock()
-
-	// Throttle: 3-6 seconds between requests
-	minInterval := 3*time.Second + time.Duration(rand.Intn(3000))*time.Millisecond
-	elapsed := time.Since(globalLastVkFetchTime)
-
-	if !globalLastVkFetchTime.IsZero() && elapsed < minInterval {
-		wait := minInterval - elapsed
-		log.Printf("[STREAM %d] [VK Auth] Throttling: waiting %v to prevent rate limit...", streamID, wait.Truncate(time.Millisecond))
-		select {
-		case <-ctx.Done():
-			return "", "", nil, ctx.Err()
-		case <-time.After(wait):
-		}
+	// Upstream 0957a53: keep serialization but avoid 3-6 seconds per group.
+	minInterval := 600*time.Millisecond + time.Duration(rand.Intn(400))*time.Millisecond
+	if err := vkRequestGate.acquire(ctx, minInterval); err != nil {
+		return "", "", nil, err
 	}
-
-	defer func() {
-		globalLastVkFetchTime = time.Now()
-	}()
+	defer vkRequestGate.release()
 
 	return fetchVkCreds(ctx, link, streamID)
 }
